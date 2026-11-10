@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "cpus": 8,
+  "memory_mib": 8192,
+  "resolution": "1920x1080",
+  "disk_gib": 128,
+  "cpu": "Haswell-noTSX,stepping=3,vendor=GenuineIntel,+ssse3,+sse4.2,+popcnt,+avx,+avx2,+aes,+xsave,+xsaveopt,-arat,enforce",
+  "mac": "52:54:00:d7:51:17",
+  "qmp_port": 4444,
+  "ssh_port": 2222,
+  "iso": "D:\\vm mac\\macOS Sequoia 15.3(24D60)[imacos.top].iso",
+  "media_kind": "disk",
+  "base_disk": "D:\\reims\\reims-vgpu-windows-native-tahoe\\vm\\disks\\base.qcow2",
+  "active_disk": "D:\\reims\\reims-vgpu-windows-native-tahoe\\vm\\disks\\current.qcow2",
+  "opencore": "D:\\reims\\reims-vgpu-windows-native-tahoe\\vm\\firmware\\opencore-1.0.8\\OpenCore.img",
+  "firmware_code": "D:\\reims\\reims-vgpu-windows-native-tahoe\\vm\\firmware\\OVMF_CODE.fd",
+  "firmware_vars": "D:\\reims\\reims-vgpu-windows-native-tahoe\\vm\\firmware\\OVMF_VARS.fd",
+  "rom": "D:\\reims\\reims-vgpu-windows-native-tahoe\\.work\\target\\dist-vulkan\\share\\reims-vgpu\\ReimsVgpu.rom"
+}

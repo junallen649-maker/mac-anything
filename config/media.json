@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "path": "D:\\vm mac\\macOS Sequoia 15.3(24D60)[imacos.top].iso",
+  "bytes": 17578328064,
+  "container": "APM/HFS+",
+  "media_kind": "disk",
+  "boot_architecture": "x86_64",
+  "product_version": "15.3",
+  "product_build": "24D60",
+  "last_write_ticks": 639196092840000000
+}

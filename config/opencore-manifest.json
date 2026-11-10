@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "version": "1.0.8",
+  "release_url": "https://github.com/acidanthera/OpenCorePkg/releases/download/1.0.8/OpenCore-1.0.8-RELEASE.zip",
+  "release_sha256": "2011e8b7216ecb2645d97ea710df965947edd406846e92050b9bc4190be6d27b",
+  "image": "D:\\reims\\reims-vgpu-windows-native-tahoe\\vm\\firmware\\opencore-1.0.8\\OpenCore.img",
+  "image_sha256": "43E34C52DD07F27B460FE2E436B435DB2B59E0E6C463C9A34B3EC7CB7DC2471C",
+  "config": "D:\\reims\\reims-vgpu-windows-native-tahoe\\vm\\firmware\\opencore-1.0.8\\root\\EFI\\OC\\config.plist",
+  "config_sha256": "4FF3DB627236D12936C7E75E32EBD4238C7FBD68E205E8051ECEB3B94DD0EC5D",
+  "ocvalidate": "D:\\reims\\reims-vgpu-windows-native-tahoe\\.work\\downloads\\OpenCore-1.0.8\\Utilities\\ocvalidate\\ocvalidate.exe",
+  "firmware_code": "D:\\reims\\reims-vgpu-windows-native-tahoe\\vm\\firmware\\OVMF_CODE.fd",
+  "firmware_vars_template": "D:\\reims\\reims-vgpu-windows-native-tahoe\\vm\\firmware\\OVMF_VARS.template.fd",
+  "code_sha256": "33090CC07675BAA5190D9F1E84BF5176B33BCBFA9BACAC522961150CDB6DBB2A",
+  "vars_sha256": "5D2AC383371B408398ACCEE7EC27C8C09EA5B74A0DE0CEEA6513388B15BE5D1E",
+  "firmware_source": "C:\\msys64\\ucrt64\\share\\qemu",
+  "validated": true
+}
