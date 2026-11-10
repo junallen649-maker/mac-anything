@@ -7,6 +7,7 @@
 | 文件 | 内容 |
 |---|---|
 | `reims-vgpu-Windows-macOS-完整复现手册.md` | **主文档**，从 0 开始的完整步骤 + 所有踩过的坑 |
+| [实施全记录.md](实施全记录.md) | VMware、QEMU 与 reims-vgpu 的尝试过程、错误排查、修复方式及验证记录 |
 | `config/OpenCore-config.plist` | 实际生效的 OpenCore 配置（ScanPolicy=0, Timeout=20） |
 | `config/vm-config.json` | 虚拟机配置（8 vCPU / 8 GB / 128 GB） |
 | `config/media.json` | 安装镜像的识别记录（APM/HFS+, x86_64, 15.3 24D60） |

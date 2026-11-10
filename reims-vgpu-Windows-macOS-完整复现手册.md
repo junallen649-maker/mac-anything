@@ -1,210 +1,568 @@
-# 在 Windows 上用 RTX 3060 跑 macOS Sequoia（reims-vgpu 方案）
+# Windows 宿主机运行 macOS Sequoia 并启用 NVIDIA GPU 加速
 
-> **本文档基于 2026-11-10 一次完整的实战验证**。
-> 最终结果：Windows 11 + Hyper-V/WHPX + QEMU 11.1.50（自编译）+ OpenCore 1.0.8 + reims-vgpu（Vulkan→Metal 翻译层），
-> macOS Sequoia 15.3 安装成功并进入桌面，**NVIDIA RTX 3060 通过 Vulkan 实际参与图形渲染（2.2 ms/帧）**。
->
-> **这条路 VMware Workstation 永远做不到**，因为它没有 GPU 直通，且 macOS 没有 NVIDIA 驱动。
-> reims-vgpu 的巧思在于：让 macOS 以为自己在跟一块 **Apple 半虚拟化 GPU** 通信，
-> 背后由宿主机的 Vulkan 驱动（NVIDIA）实际执行绘制。
+技术方案：QEMU + WHPX + OpenCore + reims-vgpu
 
 ---
 
-## 目录
+# 一、方案定义
 
-- [0. 方案原理](#0-方案原理)
-- [1. 硬件与软件要求](#1-硬件与软件要求)
-- [2. 与 VMware 方案的对比](#2-与-vmware-方案的对比)
-- [3. 从零开始的完整步骤](#3-从零开始的完整步骤)
-  - [3.1 开启 Hyper-V / WHPX](#31-开启-hyper-v--whpx)
-  - [3.2 安装 MSYS2](#32-安装-msys2)
-  - [3.3 安装编译工具链](#33-安装编译工具链)
-  - [3.4 安装 Rust（GNU 工具链）](#34-安装-rustgnu-工具链)
-  - [3.5 下载 reims-vgpu 与 QEMU 源码](#35-下载-reims-vgpu-与-qemu-源码)
-  - [3.6 编译 GPU 固件](#36-编译-gpu-固件)
-  - [3.7 编译 Rust dist](#37-编译-rust-dist)
-  - [3.8 编译 QEMU](#38-编译-qemu)
-  - [3.9 准备 OpenCore 引导盘](#39-准备-opencore-引导盘)
-  - [3.10 准备虚拟机磁盘](#310-准备虚拟机磁盘)
-  - [3.11 启动并安装 macOS](#311-启动并安装-macos)
-- [4. 踩过的坑（重点，能省你两天）](#4-踩过的坑重点能省你两天)
-- [5. 文件清单](#5-文件清单)
-- [6. 关键配置速查](#6-关键配置速查)
-- [7. 日常操作](#7-日常操作)
-- [8. 性能实测数据](#8-性能实测数据)
-- [9. 故障排查](#9-故障排查)
+## 1.1 目标
 
----
+在 Windows 11 宿主机上：
+1. 运行 macOS Sequoia 15.x x86_64 虚拟机
+2. 使用宿主机 NVIDIA 显卡参与图形渲染
+3. 不使用 PCIe 直通
 
-## 0. 方案原理
+## 1.2 实现路径
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  Windows 11                                              │
-│  ├── NVIDIA 驱动 (32.0.16.1742)                          │
-│  │   └── Vulkan 运行时                                    │
-│  └── Hyper-V / WHPX  (Windows Hypervisor Platform)       │
-│       └── QEMU 11.1.50（自编译，含 --enable-pvg）          │
-│            ├── OVMF (edk2-x86_64-code.fd)   UEFI 固件     │
-│            ├── OpenCore 1.0.8               引导器        │
-│            ├── apple-gfx-pci  ← 虚拟 Apple GPU 设备        │
-│            │   └── ReimsVgpu.rom  (GPU option ROM)        │
-│            │   └── reims_vgpu_c.dll (Vulkan→Metal 翻译)   │
-│            └── macOS Sequoia 15.3 guest                  │
-│                 └── 用系统自带的 Apple GPU 驱动            │
-│                     （以为是真 Apple GPU，实际走 Vulkan）  │
-└──────────────────────────────────────────────────────────┘
+Windows 11
+├── NVIDIA 驱动 → Vulkan 运行时
+├── Hyper-V / Windows Hypervisor Platform (WHPX)
+└── QEMU 11.1.50（自编译，启用 --enable-pvg --enable-whpx）
+    ├── OVMF (edk2-x86_64-code.fd)           UEFI 固件
+    ├── OpenCore 1.0.8                        引导器
+    ├── apple-gfx-pci                         虚拟 Apple Paravirtualized GPU
+    │   ├── ReimsVgpu.rom                     GPU option ROM
+    │   └── reims_vgpu_c.dll                  Vulkan → Metal 命令翻译层
+    └── macOS Sequoia 15.3 guest
+        └── Apple Paravirtualized Graphics 驱动（macOS 系统自带）
 ```
 
-**关键认知**：
+## 1.3 技术原理
 
-1. **macOS 侧不需要 NVIDIA 驱动**。它驱动的是"Apple Paravirtualized Graphics Device"，
-   reims-vgpu 在 QEMU 里模拟这个设备的 MMIO 寄存器，把 Metal 命令翻译成 Vulkan 命令。
-2. **Apple 封杀的是"物理 NVIDIA 显卡驱动"，不是"任何跟 NVIDIA 沾边的图形栈"**。
-   只要 macOS 不直接看到 NVIDIA 设备，就能用 NVIDIA 的算力。
-3. **不需要 GPU 直通**。所以不需要 ESXi，不需要双显卡。
+macOS 驱动栈只调用 `Apple Paravirtualized Graphics` 设备接口。该接口由 QEMU 的 `apple-gfx-pci` 设备实现。设备的 MMIO 读写被 `reims_vgpu_c.dll` 翻译为 Vulkan 调用，由宿主机 GPU 执行。
 
----
+macOS 不检测、不驱动宿主机物理显卡。Apple 对 NVIDIA 物理显卡驱动的封锁不适用于此路径。
 
-## 1. 硬件与软件要求
+## 1.4 与 VMware Workstation 方案的差异
 
-### 1.1 硬件
-
-| 项目 | 要求 | 本次实测配置 |
+| 项目 | VMware + OC4VM | QEMU + reims-vgpu |
 |---|---|---|
-| CPU | Intel/AMD x86_64，**必须支持 AVX / AVX2 / F16C / RDRAND** | Intel i7-12700KF（12核/20线程） |
-| 内存 | ≥ 16 GB（给虚拟机 8–16 GB） | 64 GB DDR4-3200 |
-| 主板 | **BIOS 里开启 VT-x / AMD-V** | ASUS PRIME B760M-K D4 |
-| 显卡 | **支持 Vulkan 的任意 GPU**（NVIDIA/AMD/Intel 都行） | NVIDIA RTX 3060 |
-| 磁盘 | 预留 ≥ 60 GB（编译产物 + 虚拟机磁盘） | 致态 Ti600 1 TB NVMe + 4 TB SATA |
+| macOS 启动 | 支持 | 支持 |
+| 宿主机 GPU 参与渲染 | 不支持 | 支持 |
+| 虚拟显存上限 | 128 MB（`svga.vramSize` 硬编码截断） | 8 GB |
+| 图形界面实时模糊 | 无法实现 | 正常 |
+| 单帧渲染耗时 | 未测量 | 2.0–3.3 ms |
+| GPU 直通 | 不支持 | 不需要 |
+| 需要重装 macOS | 否 | 是 |
+| 需要编译 | 否 | 是（约 60 分钟） |
+| 其他虚拟机共存 | 可以 | 不可以（Hyper-V 独占） |
 
-**验证 CPU 指令集**（PowerShell）：
+---
+
+# 二、项目来源与文件出处
+
+## 2.1 使用的三个仓库
+
+本方案依赖三个 GitHub 仓库，全部为 fork 分支，非原作者主线。
+
+### 2.1.1 主程序：tqmane/reims-vgpu（分支 windows-native-tahoe）
+
+```
+https://github.com/tqmane/reims-vgpu/tree/windows-native-tahoe
+```
+
+| 项目 | 内容 |
+|---|---|
+| 原始仓库 | `https://github.com/steelbrain/reims-vgpu` |
+| 使用的 fork | `https://github.com/tqmane/reims-vgpu` |
+| 使用的分支 | `windows-native-tahoe` |
+| 提交时间 | 2026-11-01（commit `8f316b5`） |
+| 语言 | Rust |
+| 星标数 | 679 |
+| zip 大小 | 32.2 MB |
+| 本地路径 | `D:\reims\reims-vgpu-windows-native-tahoe\` |
+
+该分支相对原始仓库新增：
+
+| 新增内容 | 说明 |
+|---|---|
+| WHPX 支持 | Windows Hypervisor Platform 加速 |
+| UCRT64/LLVM 原生构建 | 不使用 MSVC 工具链 |
+| SDL3 Win32/Vulkan 窗口 | 替代 QEMU 自带显示 |
+| `scripts/windows/` | 整套 PowerShell 管理脚本 |
+| `docs/windows-vm.md` | Windows VM 准备文档 |
+| `docs/IMPLEMENTATION_STATUS.md` | 实现状态 |
+| `docs/KNOWN_ISSUES.md` | 已知问题清单 |
+| `apps/` | Fluent 图形管理器（可选） |
+
+**原始仓库不支持 Windows**。`steelbrain/reims-vgpu` 的 `master` 分支仅支持：
+
+| 宿主类型 | 图形后端 |
+|---|---|
+| macOS（Apple Silicon） | Metal 直通 |
+| Linux + KVM | Vulkan |
+
+因此 Windows 环境必须使用 `tqmane` 的 fork。
+
+### 2.1.2 QEMU 源码：tqmane/qemu-reims-vgpu（分支 windows-native-tahoe）
+
+```
+https://github.com/tqmane/qemu-reims-vgpu/tree/windows-native-tahoe
+```
+
+| 项目 | 内容 |
+|---|---|
+| 原始仓库 | `https://github.com/qemu/qemu` |
+| 使用的 fork | `https://github.com/tqmane/qemu-reims-vgpu` |
+| 使用的分支 | `windows-native-tahoe` |
+| QEMU 版本 | 11.1.50 |
+| zip 大小 | 42.9 MB |
+| 解压后 | 139 MB / 11438 个文件 |
+| 本地路径 | `D:\reims\reims-vgpu-windows-native-tahoe\vendor\qemu\` |
+
+该分支相对原版 QEMU 新增的文件：
+
+| 文件 | 大小 | 作用 |
+|---|---|---|
+| `hw/display/apple-gfx.c` | — | 虚拟 GPU 主体逻辑 |
+| `hw/display/apple-gfx-pci.c` | — | PCI 设备注册（设备名 `apple-gfx-pci`） |
+| `hw/display/apple-gfx-mmio.c` | — | MMIO 寄存器读写 |
+| `hw/display/apple-gfx-activity.m` | — | Metal 活动状态桥接（Objective-C） |
+| `hw/display/apple-gfx-activity-stub.c` | — | 非 macOS 宿主的空实现 |
+
+修改的构建配置：
+
+| 文件 | 修改 |
+|---|---|
+| `meson_options.txt` | 新增 `option('pvg', type: 'feature', value: 'auto')` |
+| `hw/display/meson.build` | 新增 `system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'], ...)` |
+
+### 2.1.3 翻译层：tqmane/metal2vulkan
+
+```
+https://github.com/tqmane/metal2vulkan
+```
+
+| 项目 | 内容 |
+|---|---|
+| 仓库 | `https://github.com/tqmane/metal2vulkan` |
+| 固定 commit | `7f09d6be92aa98fb8f5cf4d47c8441d2351bc6fb` |
+| 获取方式 | Cargo 在编译 `reims-vgpu` 时按 `Cargo.toml` 声明的 rev 自动拉取 |
+| 本地路径 | `~/.cargo/git/checkouts/metal2vulkan-*/`（不单独存放） |
+
+作用：把 Metal API 调用翻译为 Vulkan API 调用。
+
+`Cargo.toml` 中的声明：
+
+```toml
+metal2vulkan-runtime = { git = "https://github.com/tqmane/metal2vulkan", rev = "7f09d6be92aa98fb8f5cf4d47c8441d2351bc6fb" }
+metal2vulkan         = { git = "https://github.com/tqmane/metal2vulkan", rev = "7f09d6be92aa98fb8f5cf4d47c8441d2351bc6fb" }
+```
+
+## 2.2 仓库之间的关系
+
+```
+tqmane/reims-vgpu (分支 windows-native-tahoe)
+│
+├── crates/reims-vgpu-core          核心逻辑（架构、设备模型）
+├── crates/reims-vgpu-metal         Metal 接口定义（Objective-C 绑定）
+├── crates/reims-vgpu-vulkan        Vulkan 后端实现
+├── crates/reims-vgpu-window        窗口系统（SDL3 / AppKit）
+├── crates/reims-vgpu-c             C ABI 导出 → 编译为 reims_vgpu_c.dll
+├── crates/reims-vgpu               公共 crate
+├── xtask                           构建工具 → cargo xtask dist --platform vulkan
+│
+├── vendor/qemu/                    ← tqmane/qemu-reims-vgpu（手动下载放入）
+│   ├── configure
+│   ├── meson.build
+│   └── hw/display/apple-gfx*.c     虚拟 GPU 设备
+│
+├── firmware/
+│   ├── Makefile                    → 编译 ReimsVgpu.rom
+│   └── src/
+│       ├── ReimsVgpu.c             UEFI 驱动主体
+│       ├── GraphicsOutput.c        GOP 实现
+│       ├── ComponentName.c         组件名
+│       └── OptionRom.S             ROM 包装
+│
+├── scripts/windows/                 PowerShell 管理脚本
+│   ├── bootstrap.ps1               安装依赖
+│   ├── build.ps1                   编译流程
+│   ├── prepare-opencore.ps1        生成引导盘（★ 需修改）
+│   ├── prepare-vm.ps1              准备虚拟机磁盘
+│   ├── start.ps1                   启动
+│   ├── stop.ps1                    停止
+│   ├── snapshot.ps1                快照
+│   ├── doctor.ps1                  环境自检
+│   └── environment.ps1             环境变量设置
+│
+└── Cargo.toml
+    └── metal2vulkan 依赖           ← tqmane/metal2vulkan（cargo 自动拉取）
+```
+
+## 2.3 下载方式
+
+使用 zip 下载，不使用 `git clone`。
+
+**原因**：MSYS2 的 git 在部分 Windows 环境缺少完整 CA 证书链，执行 `git clone https://...` 报错：
+
+```
+fatal: remote helper 'https' aborted session
+```
+
+即使用 Windows 自带 git，MSYS2 bash 内的 `git submodule update` 仍可能失败。
+
+### 下载命令
 
 ```powershell
-Get-CimInstance Win32_Processor |
-  Select-Object Name, NumberOfCores, NumberOfLogicalProcessors, VirtualizationFirmwareEnabled
+$curl = 'C:\Windows\System32\curl.exe'
+$WORK = 'D:\reims'
+
+# 主程序
+& $curl -s -L --max-time 900 `
+    -o "$WORK\reims-vgpu.zip" `
+    'https://github.com/tqmane/reims-vgpu/archive/refs/heads/windows-native-tahoe.zip'
+
+# QEMU
+& $curl -s -L --max-time 1200 `
+    -o "$WORK\qemu.zip" `
+    'https://github.com/tqmane/qemu-reims-vgpu/archive/refs/heads/windows-native-tahoe.zip'
 ```
 
-`VirtualizationFirmwareEnabled` 必须是 `True`（BIOS 已开虚拟化）。
+### 解压
 
-### 1.2 软件
+```powershell
+Expand-Archive "$WORK\reims-vgpu.zip" -DestinationPath $WORK -Force
+Expand-Archive "$WORK\qemu.zip"      -DestinationPath "$WORK\qemu-tmp" -Force
+```
 
-| 软件 | 版本 | 说明 |
+解压后目录名：
+
+```
+D:\reims\
+├── reims-vgpu-windows-native-tahoe\        ← 主程序
+└── qemu-tmp\
+    └── qemu-reims-vgpu-windows-native-tahoe\   ← 需移动到 vendor\qemu
+```
+
+### 移动 QEMU 源码到 vendor 目录
+
+zip 包不包含 git submodule，`vendor\qemu` 目录为空，需手动放入：
+
+```powershell
+$REPO = 'D:\reims\reims-vgpu-windows-native-tahoe'
+$src  = Get-ChildItem 'D:\reims\qemu-tmp' -Directory | Select-Object -First 1
+
+Remove-Item "$REPO\vendor\qemu" -Recurse -Force -ErrorAction SilentlyContinue
+Move-Item   $src.FullName        "$REPO\vendor\qemu" -Force
+```
+
+### 验证
+
+```powershell
+# 文件数量
+(Get-ChildItem "$REPO\vendor\qemu" -Recurse -File).Count
+# 期望：11438
+
+# 关键文件
+Get-ChildItem "$REPO\vendor\qemu\hw\display" -Filter 'apple-gfx*' | Select-Object Name
+# 期望输出：
+#   apple-gfx-activity-stub.c
+#   apple-gfx-activity.m
+#   apple-gfx-mmio.c
+#   apple-gfx-pci.c
+#   apple-gfx.c
+
+# 版本
+Get-Content "$REPO\vendor\qemu\VERSION"
+# 期望：11.1.50
+```
+
+## 2.4 版本锁定矩阵
+
+复现时必须使用以下版本组合。版本不匹配会导致编译失败或运行时崩溃。
+
+| 组件 | 版本 | 锁定方式 |
 |---|---|---|
-| Windows | 10 1903+ / 11 | 需要 Hyper-V Platform |
-| **MSYS2** | 任意较新版本 | 提供 UCRT64 编译环境 |
-| **Rust** | **1.98.1-x86_64-pc-windows-gnu** | ★ 必须是 GNU，不是 MSVC |
-| **PowerShell** | **7.2+** | reims 脚本要求，Windows 自带 5.1 不够 |
-| Python | 3.9+ | 用于改 plist |
+| reims-vgpu | 分支 `windows-native-tahoe` | git 分支引用 |
+| QEMU | 11.1.50 | 分支 `windows-native-tahoe` |
+| metal2vulkan | commit `7f09d6b` | `Cargo.toml` 的 `rev` 字段 |
+| OpenCore | 1.0.8 | `prepare-opencore.ps1 -Version` 参数 |
+| Rust | 1.98.1-x86_64-pc-windows-gnu | `RUSTUP_TOOLCHAIN` 环境变量 |
+| clang | 23.x | MSYS2 包管理 |
+| meson | ≥ 1.6.0 | QEMU 的 `meson.build` 要求 |
+| ninja | 任意 | MSYS2 包管理 |
+| PowerShell | ≥ 7.2 | 脚本的 `#Requires` 声明 |
+
+**版本冲突案例**：
+
+| 冲突 | 症状 |
+|---|---|
+| Rust 使用 MSVC 工具链 | `error: linker 'link.exe' not found` |
+| meson < 1.6.0 | `meson.build:883: ERROR: Dependency "reims-vgpu" not found` 后续步骤失败 |
+| OpenCore ≠ 1.0.8 | `ocvalidate` 报告版本不兼容 |
+| PowerShell 5.1 | `Unable to find type [System.Runtime.Intrinsics.X86.X86Base]` |
+
+## 2.5 分支文档位置
+
+仓库内的技术文档（已复制到 `D:\mac\scripts\`）：
+
+| 文档 | 内容 |
+|---|---|
+| `docs/windows-vm.md` | Windows VM 准备、管理、Fluent 管理器说明 |
+| `docs/IMPLEMENTATION_STATUS.md` | 实现状态（2026-10-18 更新） |
+| `docs/KNOWN_ISSUES.md` | 已知问题：4K 分辨率、60 FPS、device loss |
+| `docs/windows-apple-account.md` | Apple ID 登录步骤 |
+| `docs/UPSTREAM_SYNC.md` | 与上游 `steelbrain` 的同步记录 |
+| `docs/WEBGL_DIAGNOSIS.md` | WebGL 性能诊断数据 |
+| `README.md` | 项目概述与快速开始 |
+
+## 2.6 上游公布的支持范围
+
+来源：`docs/KNOWN_ISSUES.md` 与 `README.md`
+
+**支持**：
+
+| 项目 | 说明 |
+|---|---|
+| CPU | Intel / AMD x86_64，需 AVX / AVX2 / F16C / RDRAND |
+| 宿主 | macOS（Metal）、Linux + KVM（Vulkan）、**Windows + WHPX**（本分支） |
+| guest | macOS 13 / 14 / 15 / 26 x86_64 |
+| 功能 | 图形加速、Recovery 模式、e1000e 网卡兼容 |
+
+**不支持**：
+
+| 项目 | 原因 |
+|---|---|
+| Apple Silicon CPU 上运行 Intel macOS | 架构不兼容 |
+| 非 Apple 硬件使用 Apple 半虚拟化 GPU 的全部特性 | 部分特性依赖真机固件 |
+| Tahoe 的 Liquid Glass 特效 | 需要真机 GPU 特性 |
+| macOS 27（Golden Gate）及以上 | Apple Silicon 专用 |
+| ESXi | 未适配 |
+| 显示宽度 > 2048 px | tile-texture 已知缺陷 |
+| 稳定 60 FPS | 未复现 |
+
+**作者实测环境**：
+
+| 宿主 | guest | 结果 |
+|---|---|---|
+| Intel Mac mini (Late 2014) | Big Sur / Monterey / Ventura / Sonoma / Sequoia | 通过 |
+| AMD Ryzen (HP T740) | 同上 | 通过 |
+| M3 Max | arm64 macOS 13 / 14 / 15 / 26 | 通过 |
+| Linux + RTX 5080 laptop | x86-64 macOS 26 | 通过 |
+
+---
+
+# 三、需要什么
+
+## 3.1 硬件
+
+| 项目 | 要求 | 验证方式 |
+|---|---|---|
+| CPU | x86_64，支持 AVX / AVX2 / F16C / RDRAND | 见 3.1 |
+| 内存 | ≥ 16 GB（虚拟机分配 8–16 GB） | 系统属性 |
+| 主板 | BIOS 开启 Intel VT-x 或 AMD-V | 见 3.1 |
+| 显卡 | 支持 Vulkan 1.1+（NVIDIA / AMD / Intel 均可） | 见 3.2 |
+| 磁盘 | ≥ 80 GB 可用 | 资源管理器 |
+
+**最低可用配置**：8 核 CPU / 16 GB 内存 / 60 GB 磁盘 / 支持 Vulkan 的显卡
+
+## 3.2 软件
+
+| 软件 | 版本要求 | 用途 |
+|---|---|---|
+| Windows | 10 1903+ / 11 | 宿主机系统 |
+| MSYS2 | 2024-01-13 或更新 | 编译环境（UCRT64） |
+| Rust | 1.98.1-x86_64-pc-windows-gnu | 编译 reims-vgpu |
+| PowerShell | 7.2+ | 运行 reims 脚本 |
+| Python | 3.9+ | 修改 plist |
 | 7-Zip | 任意 | 解包 OpenCore |
-| **macOS 安装镜像** | Sequoia 15.x / Tahoe 26.x | x86_64，APM/HFS+ 或 ISO9660 |
+| macOS 安装镜像 | Sequoia 15.x x86_64 | 安装源 |
 
-### 1.3 必须关闭/开启的东西
+## 3.3 文件
 
-| 项目 | 状态 | 原因 |
+| 文件 | 来源 | 大小 |
 |---|---|---|
-| **Hyper-V** | ✅ **必须开启** | QEMU 用 WHPX 加速 |
-| **HypervisorPlatform** | ✅ **必须开启** | 同上 |
-| **VirtualMachinePlatform** | ✅ **必须开启** | 同上 |
-| **VMware Workstation** | ❌ **会失效** | 和 Hyper-V 抢 VT-x |
-| **Android 模拟器** | ❌ 会失效 | 依赖 Hyper-V |
-
-**代价说明**：开 Hyper-V 后 VMware 就用不了了。想回去就关掉 Hyper-V 重启，VMware 原样恢复（vmdk 文件不受影响）。
+| reims-vgpu 源码 | `github.com/tqmane/reims-vgpu` 分支 `windows-native-tahoe` | 33 MB zip |
+| QEMU 源码 | `github.com/tqmane/qemu-reims-vgpu` 分支 `windows-native-tahoe` | 43 MB zip |
+| OVMF 固件 | MSYS2 包 `mingw-w64-ucrt-x86_64-qemu` | 4 MB |
+| OpenCore 1.0.8 | 脚本自动下载 `acidanthera/OpenCorePkg` | 自动 |
+| macOS 镜像 | 自备（Sequoia 15.3 24D60） | 16.4 GB |
 
 ---
 
-## 2. 与 VMware 方案的对比
+# 四、不需要什么
 
-| 维度 | VMware + OC4VM | **reims-vgpu + QEMU** |
-|---|---|---|
-| macOS 能否启动 | ✅ 可以（Catalina/Sonoma） | ✅ 可以（Sequoia/Tahoe） |
-| **GPU 加速** | ❌ 无（虚拟 SVGA，软件渲染） | ✅ **有（RTX 3060 实际渲染）** |
-| 显存 | 128 MB 硬上限（`svga.vramSize` 写多大都被截断） | **8 GB 可用** |
-| 3D 加速 | 半残（DX12 能开但 VRAM 卡死） | **完整（Vulkan→Metal 全链路）** |
-| 图形界面模糊效果 | ❌ 做不到 | ✅ 实时高斯模糊正常 |
-| 实时帧耗时 | — | **2.2 ms/帧** |
-| 需要重装系统 | 否 | 是（全新安装） |
-| 配置复杂度 | 简单 | 复杂（需要编译） |
-| 其他虚拟机 | 可共存 | **全部失效**（Hyper-V 独占） |
+以下项目**不需要**，确认后跳过：
 
-**结论**：
-- **只想体验 macOS** → 用 VMware 方案（简单）
-- **需要 GPU 加速 / 跑图形密集应用** → 用 reims-vgpu（本文档）
+| 项目 | 说明 |
+|---|---|
+| VMware Workstation 的 Unlocker 补丁 | 与 QEMU 方案无关 |
+| OpenCore Legacy Patcher | 用于真机，虚拟机不需要 |
+| 1401 / OpCore-Simplify | 用于真机生成 SSDT，虚拟机不需要 |
+| VS BuildTools / Visual Studio | Rust 使用 GNU 工具链，不需要 MSVC linker |
+| GPU 直通（PCIe Passthrough） | 本方案不使用 |
+| 双显卡 | 本方案不需要第二块显卡 |
+| ESXi | 本方案使用 Windows 宿主机 |
+| NVIDIA Web Driver | macOS 侧不加载 NVIDIA 驱动 |
+| 任何 macOS kext | OpenCore 的 `Kernel/Add` 保持为空 |
+| U 盘 / 安装介质 | 直接使用 ISO/IMG 文件 |
+| Apple 开发者账号 | 不需要 |
 
 ---
 
-## 3. 从零开始的完整步骤
+# 五、准备工作
 
-> **所有路径示例假设**：工作目录 `D:\reims`，MSYS2 装在 `C:\msys64`。
-> 如果你的路径不同，全部替换即可。
+## 5.1 验证 CPU 指令集
 
-### 3.1 开启 Hyper-V / WHPX
-
-**管理员 PowerShell**：
+管理员 PowerShell：
 
 ```powershell
-# 开启三个功能
+Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors,VirtualizationFirmwareEnabled
+```
+
+判断标准：
+- `VirtualizationFirmwareEnabled` 必须为 `True`
+- 若为 `False`，进入 BIOS 开启 Intel VT-x（Intel）或 SVM Mode（AMD）
+
+验证 AVX2 / F16C / RDRAND：
+
+```powershell
+$cpu = Get-CimInstance Win32_Processor
+$cpu.Name
+# 输出中若包含 "12th Gen" 或更新（Intel）/ "Ryzen"（AMD），通常已支持全部三项
+```
+
+## 5.2 验证 Vulkan
+
+```powershell
+Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion
+```
+
+驱动版本要求：
+- NVIDIA：`3xx.xx` 或更新
+- AMD：`Adrenalin 22.x` 或更新
+
+可选验证（安装 Vulkan SDK 后）：
+
+```powershell
+vulkaninfo --summary
+```
+
+输出中 `deviceName` 应显示实际 GPU 型号。
+
+## 5.3 记录环境信息
+
+后续步骤需要以下值，先记录：
+
+```powershell
+# 工作目录（建议非系统盘）
+$WORK = 'D:\reims'
+
+# MSYS2 安装路径（本手册默认）
+$MSYS = 'C:\msys64'
+
+# 7-Zip 路径
+$SEVENZIP = 'D:\7-Zip\7z.exe'
+
+# macOS 镜像路径
+$ISO = 'D:\images\macOS-Sequoia-15.3.iso'
+```
+
+创建目录：
+
+```powershell
+New-Item -ItemType Directory -Force -Path $WORK | Out-Null
+```
+
+---
+
+# 六、步骤
+
+## 步骤 1：开启 Hyper-V
+
+**目的**：启用 WHPX（Windows Hypervisor Platform），QEMU 需要它做硬件加速。
+
+管理员 PowerShell：
+
+```powershell
 Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -All -NoRestart
 Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All -NoRestart
 Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -All -NoRestart
-
-# 设置启动类型
 bcdedit /set hypervisorlaunchtype auto
-
-# 重启
 Restart-Computer
 ```
 
 **重启后验证**：
 
 ```powershell
-(Get-CimInstance Win32_ComputerSystem).HypervisorPresent    # 必须 True
-Get-Service vmcompute, vmms | Select-Object Name, Status   # 都必须是 Running
+(Get-CimInstance Win32_ComputerSystem).HypervisorPresent
+# 必须输出 True
+
+Get-Service vmcompute, vmms | Select-Object Name, Status
+# 两个服务的 Status 必须都是 Running
+
+bcdedit /enum "{current}" | Select-String hypervisorlaunchtype
+# 必须输出 hypervisorlaunchtype    Auto
 ```
 
-**验证 Vulkan**（如果装了 Vulkan SDK）：
+**副作用**：VMware Workstation、Android 模拟器、WSL2 之外的部分工具将无法运行。
+
+**回滚方法**（后续如需恢复 VMware）：
 
 ```powershell
-vulkaninfo --summary    # 应该列出 RTX 3060
+Disable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -NoRestart
+Disable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -NoRestart
+Disable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -NoRestart
+bcdedit /set hypervisorlaunchtype off
+Restart-Computer
 ```
+
+VMware 的 vmdk 文件不受影响，关闭 Hyper-V 后可原样启动。
 
 ---
 
-### 3.2 安装 MSYS2
+## 步骤 2：安装 MSYS2
 
-**★ 不要用安装器 exe**（Qt Installer Framework 的静默参数不兼容，会失败）。
+**目的**：提供 UCRT64 编译环境（clang、cmake、ninja、meson、pkg-config）。
 
-**用官方 base tarball**：
+**不使用安装器 exe**。原因：MSYS2 安装器基于 Qt Installer Framework，静默参数 `in --confirm-command --root` 在部分环境返回退出码 1；7-Zip 无法解包该格式。
+
+**使用官方 base tarball**：
 
 ```powershell
 $curl = 'C:\Windows\System32\curl.exe'
-$url = 'https://github.com/msys2/msys2-installer/releases/download/2024-01-13/msys2-base-x86_64-20240113.tar.xz'
-$out = 'C:\macOS\tools\msys2-base.tar.xz'
+$url  = 'https://github.com/msys2/msys2-installer/releases/download/2024-01-13/msys2-base-x86_64-20240113.tar.xz'
+$out  = "$env:TEMP\msys2-base.tar.xz"
 
-# 下载
 & $curl -s -L --max-time 900 -o $out $url
-
-# 用 Windows 自带 tar 解压到 C:\
 & tar.exe -xJf $out -C 'C:\'
-
-# 验证
-Test-Path 'C:\msys64\usr\bin\bash.exe'    # 必须 True
 ```
 
-**初始化 MSYS2**：
+**验证**：
+
+```powershell
+Test-Path 'C:\msys64\usr\bin\bash.exe'
+# 必须输出 True
+
+Get-ChildItem 'C:\msys64' | Select-Object Name
+# 应包含 ucrt64 目录
+```
+
+**初始化**：
 
 ```powershell
 & 'C:\msys64\usr\bin\bash.exe' -lc "pacman-key --init; pacman-key --populate msys2; pacman -Sy --noconfirm"
 ```
 
+**预期末尾输出**：`Initial setup complete. MSYS2 is now ready to use.`
+
 ---
 
-### 3.3 安装编译工具链
+## 步骤 3：安装编译工具链
+
+**目的**：安装 clang / llvm / cmake / ninja / meson / glib2 / pixman / SDL2 / Vulkan 头文件 / OVMF。
 
 ```powershell
 $bash = 'C:\msys64\usr\bin\bash.exe'
-$pkgs = @(
-  'make','diffutils','bison','flex',
+
+$packages = @(
+  'make',
+  'diffutils',
+  'bison',
+  'flex',
   'mingw-w64-ucrt-x86_64-clang',
   'mingw-w64-ucrt-x86_64-llvm',
   'mingw-w64-ucrt-x86_64-llvm-tools',
@@ -223,53 +581,59 @@ $pkgs = @(
   'mingw-w64-ucrt-x86_64-vulkan-loader',
   'mingw-w64-ucrt-x86_64-vulkan-validation-layers',
   'mingw-w64-ucrt-x86_64-spirv-tools',
-  'mingw-w64-ucrt-x86_64-qemu',        # ★ 提供 OVMF (edk2-*.fd)
+  'mingw-w64-ucrt-x86_64-qemu',
   'git'
 ) -join ' '
 
-& $bash -lc "pacman -S --noconfirm --needed $pkgs"
+& $bash -lc "pacman -S --noconfirm --needed $packages"
 ```
 
-**验证**：
+**注意**：`mingw-w64-ucrt-x86_64-qemu` 仅用于提供 OVMF 固件文件，其自带 QEMU 不使用。
+
+**验证工具链**：
 
 ```powershell
-& 'C:\msys64\ucrt64\bin\clang.exe' --version      # 23.x
-& 'C:\msys64\ucrt64\bin\cmake.exe' --version      # 4.x
-& 'C:\msys64\ucrt64\bin\ninja.exe' --version      # 1.13.x
-& 'C:\msys64\ucrt64\bin\meson.exe' --version      # 1.12.x
+& 'C:\msys64\ucrt64\bin\clang.exe'  --version   # 期望 23.x
+& 'C:\msys64\ucrt64\bin\cmake.exe'  --version   # 期望 4.x
+& 'C:\msys64\ucrt64\bin\ninja.exe'  --version   # 期望 1.13.x
+& 'C:\msys64\ucrt64\bin\meson.exe'  --version   # 期望 1.12.x
+& 'C:\msys64\ucrt64\bin\pkg-config.exe' --version
 ```
 
-**★ 关键**：`mingw-w64-ucrt-x86_64-qemu` 这个包会带来 OVMF 固件：
+**验证 OVMF 存在**：
 
-```
-C:\msys64\ucrt64\share\qemu\edk2-x86_64-code.fd      3.48 MB
-C:\msys64\ucrt64\share\qemu\edk2-i386-vars.fd        0.52 MB
+```powershell
+Get-ChildItem 'C:\msys64\ucrt64\share\qemu' -Filter 'edk2-x86_64-code.fd'
+# 必须存在，约 3.48 MB
+
+Get-ChildItem 'C:\msys64\ucrt64\share\qemu' -Filter 'edk2-i386-vars.fd'
+# 必须存在，约 0.52 MB
 ```
 
 ---
 
-### 3.4 安装 Rust（GNU 工具链）
+## 步骤 4：安装 Rust（GNU 工具链）
 
-**★ 必须是 `x86_64-pc-windows-gnu`，不是 MSVC**（MSVC 需要 VS BuildTools 的 link.exe，本方案不需要）。
+**目的**：编译 reims-vgpu 的 Rust 代码。
+
+**使用 GNU 工具链，不使用 MSVC**。原因：MSVC 工具链需要 Visual Studio Build Tools 的 `link.exe`，GNU 工具链使用 MSYS2 的 `clang.exe` 作为 linker，无需额外安装。
 
 ```powershell
 $curl = 'C:\Windows\System32\curl.exe'
-$url = 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe'
-$out = 'C:\macOS\tools\rustup-init.exe'
-& $curl -s -L --max-time 600 -o $out $url
+$url  = 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe'
+$out  = "$env:TEMP\rustup-init.exe"
 
-# 先装个基础 rustup
+& $curl -s -L --max-time 600 -o $out $url
 & $out -y --default-toolchain stable --profile minimal
 
-# 装 GNU 工具链
-& "$env:USERPROFILE\.cargo\bin\rustup.exe" toolchain install 1.98.1-x86_64-pc-windows-gnu `
-    --profile minimal --component rustfmt --component clippy
+# 安装 GNU 工具链
+& "$env:USERPROFILE\.cargo\bin\rustup.exe" toolchain install 1.98.1-x86_64-pc-windows-gnu --profile minimal --component rustfmt --component clippy
 
-# ★ 设为默认（重要）
+# 设为默认
 & "$env:USERPROFILE\.cargo\bin\rustup.exe" default 1.98.1-x86_64-pc-windows-gnu
 ```
 
-**配置 linker**（Rust 的 GNU target 需要一个 linker，用 MSYS2 的 clang）：
+**配置 linker 环境变量**（当前会话）：
 
 ```powershell
 $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = 'C:\msys64\ucrt64\bin\clang.exe'
@@ -278,168 +642,230 @@ $env:CXX = 'C:\msys64\ucrt64\bin\clang++.exe'
 $env:AR  = 'C:\msys64\ucrt64\bin\llvm-ar.exe'
 ```
 
-**装 cbindgen**：
+**安装 cbindgen**：
 
 ```powershell
 & "$env:USERPROFILE\.cargo\bin\cargo.exe" install --locked cbindgen --version 0.29.4
 ```
 
-**装 PowerShell 7**（reims 脚本要求 7.2+）：
+**验证**：
+
+```powershell
+& "$env:USERPROFILE\.cargo\bin\rustc.exe"    --version   # 期望 1.98.1
+& "$env:USERPROFILE\.cargo\bin\cbindgen.exe" --version   # 期望 cbindgen 0.29.4
+```
+
+---
+
+## 步骤 5：安装 PowerShell 7
+
+**目的**：reims 的 PowerShell 脚本要求 `#Requires -Version 7.2`。Windows 自带 PowerShell 5.1 不支持脚本中使用的 .NET Core 类型 `System.Runtime.Intrinsics.X86.X86Base`。
 
 ```powershell
 $curl = 'C:\Windows\System32\curl.exe'
-$url = 'https://github.com/PowerShell/PowerShell/releases/download/v7.4.6/PowerShell-7.4.6-win-x64.msi'
-& $curl -s -L -o 'C:\macOS\tools\pwsh7.msi' $url
-Start-Process msiexec.exe -ArgumentList '/i','C:\macOS\tools\pwsh7.msi','/quiet','/norestart' -Wait
-# 验证
+$url  = 'https://github.com/PowerShell/PowerShell/releases/download/v7.4.6/PowerShell-7.4.6-win-x64.msi'
+$out  = "$env:TEMP\pwsh7.msi"
+
+& $curl -s -L --max-time 600 -o $out $url
+Start-Process msiexec.exe -ArgumentList '/i', $out, '/quiet', '/norestart' -Wait
+```
+
+**验证**：
+
+```powershell
 & 'C:\Program Files\PowerShell\7\pwsh.exe' --version
+# 期望输出 PowerShell 7.4.6
 ```
 
 ---
 
-### 3.5 下载 reims-vgpu 与 QEMU 源码
+## 步骤 6：下载源码
 
-**★ 不要用 `git clone`**（MSYS2 的 git 可能缺证书链，报 `remote helper 'https' aborted session`）。
-**用 zip 下载**：
+**目的**：获取 reims-vgpu 与配套 QEMU 源码。
+
+**使用 zip 下载，不使用 `git clone`**。原因：MSYS2 的 git 在部分 Windows 环境缺少完整证书链，报错 `fatal: remote helper 'https' aborted session`。
 
 ```powershell
 $curl = 'C:\Windows\System32\curl.exe'
-$work = 'D:\reims'
-New-Item -ItemType Directory -Force -Path $work | Out-Null
+$WORK = 'D:\reims'
 
-# 1. reims-vgpu 的 windows-native-tahoe 分支
-& $curl -s -L --max-time 900 -o "$work\reims-vgpu.zip" `
+# reims-vgpu
+& $curl -s -L --max-time 900 -o "$WORK\reims-vgpu.zip" `
     'https://github.com/tqmane/reims-vgpu/archive/refs/heads/windows-native-tahoe.zip'
-Expand-Archive "$work\reims-vgpu.zip" -DestinationPath $work -Force
+Expand-Archive "$WORK\reims-vgpu.zip" -DestinationPath $WORK -Force
 
-# 2. QEMU（reims 的自定义分支）
-& $curl -s -L --max-time 1200 -o "$work\qemu.zip" `
+# QEMU
+& $curl -s -L --max-time 1200 -o "$WORK\qemu.zip" `
     'https://github.com/tqmane/qemu-reims-vgpu/archive/refs/heads/windows-native-tahoe.zip'
-Expand-Archive "$work\qemu.zip" -DestinationPath "$work\qemu-tmp" -Force
-
-# 3. 把 QEMU 放进 vendor/qemu
-$repo = "$work\reims-vgpu-windows-native-tahoe"
-$src = Get-ChildItem "$work\qemu-tmp" -Directory | Select-Object -First 1
-Remove-Item "$repo\vendor\qemu" -Recurse -Force -ErrorAction SilentlyContinue
-Move-Item $src.FullName "$repo\vendor\qemu" -Force
-
-# 验证（应该有 hw/display/apple-gfx-*.c）
-Get-ChildItem "$repo\vendor\qemu\hw\display" -Filter 'apple-gfx*'
+Expand-Archive "$WORK\qemu.zip" -DestinationPath "$WORK\qemu-tmp" -Force
 ```
 
-**预期文件**：
+**将 QEMU 源码放入 vendor 目录**：
 
+```powershell
+$REPO = "$WORK\reims-vgpu-windows-native-tahoe"
+$src  = Get-ChildItem "$WORK\qemu-tmp" -Directory | Select-Object -First 1
+
+Remove-Item "$REPO\vendor\qemu" -Recurse -Force -ErrorAction SilentlyContinue
+Move-Item $src.FullName "$REPO\vendor\qemu" -Force
 ```
-vendor\qemu\hw\display\apple-gfx.c               ← GPU 主逻辑
-vendor\qemu\hw\display\apple-gfx-pci.c           ← PCI 设备
-vendor\qemu\hw\display\apple-gfx-mmio.c          ← MMIO 寄存器
-vendor\qemu\hw\display\apple-gfx-activity.m      ← Metal 活动桥
-vendor\qemu\hw\display\apple-gfx-activity-stub.c
+
+**验证**：
+
+```powershell
+Get-ChildItem "$REPO\vendor\qemu\hw\display" -Filter 'apple-gfx*' | Select-Object Name
+# 必须包含：
+#   apple-gfx.c
+#   apple-gfx-pci.c
+#   apple-gfx-mmio.c
+#   apple-gfx-activity.m
+#   apple-gfx-activity-stub.c
+
+(Get-ChildItem "$REPO\vendor\qemu" -Recurse -File).Count
+# 期望约 11438
 ```
 
 ---
 
-### 3.6 编译 GPU 固件
+## 步骤 7：编译 GPU 固件
 
-GPU 的 option ROM（`ReimsVgpu.rom`），提供 UEFI 显示驱动。
+**目的**：生成 `ReimsVgpu.rom`（虚拟 GPU 的 UEFI option ROM）。
+
+**原理**：`make -C firmware` 使用 clang 编译 EFI 驱动，再用 lld-link 链接，最后用 llvm-objcopy 转为 rom。
 
 ```powershell
-$repo   = 'D:\reims\reims-vgpu-windows-native-tahoe'
-$bash   = 'C:\msys64\usr\bin\bash.exe'
-$buildWin = ($repo + '\.work\target') -replace '\\','/' + '/firmware'
-New-Item -ItemType Directory -Force -Path "$repo\.work\target\firmware" | Out-Null
+$REPO  = 'D:\reims\reims-vgpu-windows-native-tahoe'
+$bash  = 'C:\msys64\usr\bin\bash.exe'
+$BUILD = ($REPO -replace '\\','/') + '/.work/target/firmware'
 
-# ★ 关键参数说明：
-#   MSYS2_ARG_CONV_EXCL=*  → 防止 MSYS2 把 /nologo、/dll 等 linker 参数误转为路径
-#   BUILD=D:/...           → 必须用 Windows 混合路径（cygpath -m 效果），lld-link 才认得
-$cmds = @(
+New-Item -ItemType Directory -Force -Path "$REPO\.work\target\firmware" | Out-Null
+
+$cmd = @(
   'export PATH=/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH',
   'export MSYSTEM=UCRT64',
   'export MSYS2_ARG_CONV_EXCL=*',
   'cd /d/reims/reims-vgpu-windows-native-tahoe',
-  "make -C firmware OS=Windows_NT BUILD=$buildWin rom",
+  "make -C firmware OS=Windows_NT BUILD=$BUILD rom",
   'echo MAKE_EXIT=$?'
 ) -join ' ; '
 
-& $bash -lc $cmds
+& $bash -lc $cmd
 ```
 
-**预期产物**：
+**参数说明**：
 
-```
-.work\target\firmware\ReimsVgpu.efi    5.3 KB
-.work\target\firmware\ReimsVgpu.rom    5.5 KB   ← 关键
+| 参数 | 作用 | 不设置时的错误 |
+|---|---|---|
+| `MSYS2_ARG_CONV_EXCL=*` | 禁止 MSYS2 将 `/nologo` `/dll` 等参数转为路径 | `lld-link: error: could not open 'C:/msys64/nologo'` |
+| `BUILD=D:/...` | 使用 Windows 混合路径 | `lld-link: error: could not open '/d/reims/.../ReimsVgpu.obj'` |
+
+**验证**：
+
+```powershell
+Get-ChildItem "$REPO\.work\target\firmware" -Filter 'ReimsVgpu.*'
+# 必须包含：
+#   ReimsVgpu.efi   约 5.3 KB
+#   ReimsVgpu.rom   约 5.5 KB
 ```
 
 ---
 
-### 3.7 编译 Rust dist
+## 步骤 8：编译 Rust dist
+
+**目的**：生成 `reims_vgpu_c.dll`（Vulkan→Metal 翻译层）与 C 头文件。
 
 ```powershell
-$repo  = 'D:\reims\reims-vgpu-windows-native-tahoe'
+$REPO  = 'D:\reims\reims-vgpu-windows-native-tahoe'
 $cargo = "$env:USERPROFILE\.cargo\bin\cargo.exe"
 
-# 环境变量（★ 必须全部设置）
-$env:RUSTUP_TOOLCHAIN = '1.98.1-x86_64-pc-windows-gnu'    # 覆盖 rust-toolchain.toml 里的 host
+$env:RUSTUP_TOOLCHAIN = '1.98.1-x86_64-pc-windows-gnu'
+$env:RUSTUP_AUTO_INSTALL = '0'
 $env:REIMS_MSYS2_ROOT = 'C:\msys64'
 $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = 'C:\msys64\ucrt64\bin\clang.exe'
 $env:CC  = 'C:\msys64\ucrt64\bin\clang.exe'
 $env:CXX = 'C:\msys64\ucrt64\bin\clang++.exe'
-$env:CARGO_TARGET_DIR = "$repo\.work\target"
+$env:CARGO_TARGET_DIR = "$REPO\.work\target"
 $env:PYTHONUTF8 = '1'
-$env:RUSTUP_AUTO_INSTALL = '0'
 $env:PATH = "C:\msys64\ucrt64\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
 
-Set-Location $repo
+Set-Location $REPO
 & $cargo xtask dist --platform vulkan --profile release
 ```
 
-**预期产物**（`dist-vulkan\` 下）：
+**`RUSTUP_TOOLCHAIN` 必设的原因**：仓库 `rust-toolchain.toml` 内容为 `channel = "1.98.1"`，未指定 target。rustup 按默认 host 解析为 `x86_64-pc-windows-msvc`，导致找不到 `link.exe`。环境变量优先级高于该文件。
 
+**预期编译时间**：3–4 分钟。
+
+**验证产物**：
+
+```powershell
+Get-ChildItem "$REPO\.work\target\dist-vulkan" -Recurse -File |
+  Select-Object @{n='Path';e={$_.FullName.Replace("$REPO\.work\target\dist-vulkan\",'')}}, @{n='MB';e={[math]::Round($_.Length/1MB,2)}}
+
+# 必须包含：
+#   lib\libreims_vgpu.a          约 606 MB
+#   lib\reims_vgpu_c.dll         约 191 MB
+#   lib\pkgconfig\reims-vgpu.pc
+#   include\reims_vgpu.h
+#   share\reims-vgpu\ReimsVgpu.rom
 ```
-lib\libreims_vgpu.a         606 MB
-lib\reims_vgpu_c.dll        191 MB
-lib\pkgconfig\reims-vgpu.pc
-include\reims_vgpu.h
-share\reims-vgpu\ReimsVgpu.rom
-```
 
-**★ 编译成功后必须修 pc 文件**（生成的是 MSVC 风格，pkg-config 解析会卡住）：
+**修改 pc 文件**：
 
-文件：`.work\target\dist-vulkan\lib\pkgconfig\reims-vgpu.pc`
+文件 `.work\target\dist-vulkan\lib\pkgconfig\reims-vgpu.pc`，将：
 
 ```ini
-# 原始（错误的）
 Libs: -L${libdir} -lreims_vgpu_c.dll
+```
 
-# 改成
+改为：
+
+```ini
 Libs: -L${libdir} -lreims_vgpu_c
+```
+
+**原因**：`pkg-config` 遇到 `-lxxx.dll` 时 `pkg-config --exists` 会挂起不返回。`-l` 参数只接受库名，不接受文件名后缀。
+
+**验证 pkg-config**：
+
+```powershell
+& 'C:\msys64\usr\bin\bash.exe' -lc @'
+export PATH=/c/msys64/ucrt64/bin:$PATH
+export PKG_CONFIG_PATH=/d/reims/reims-vgpu-windows-native-tahoe/.work/target/dist-vulkan/lib/pkgconfig
+pkg-config --exists reims-vgpu; echo "exists_exit=$?"
+pkg-config --libs reims-vgpu
+'@
+
+# 期望输出：
+#   exists_exit=0
+#   -LD:/reims/.../dist-vulkan/lib -lreims_vgpu_c
 ```
 
 ---
 
-### 3.8 编译 QEMU
+## 步骤 9：编译 QEMU
+
+**目的**：生成带 `apple-gfx-pci` 设备与 WHPX 支持的 QEMU。
+
+### 10.1 configure
 
 ```powershell
-$repo   = 'D:\reims\reims-vgpu-windows-native-tahoe'
-$bash   = 'C:\msys64\usr\bin\bash.exe'
-New-Item -ItemType Directory -Force -Path "$repo\build\qemu" | Out-Null
+$REPO = 'D:\reims\reims-vgpu-windows-native-tahoe'
+$bash = 'C:\msys64\usr\bin\bash.exe'
 
-# ---------- configure ----------
-# ★ 注意：configure 阶段【不要】设 MSYS2_ARG_CONV_EXCL
-#   否则 configure 内部的 cygpath 会把 /d/reims 错误转为 D:/d/reims
-# ★ PKG_CONFIG_PATH 用 MSYS2 格式（/d/...），不能用 D:/...
-$pkgPath = '/d/reims/reims-vgpu-windows-native-tahoe/.work/target/dist-vulkan/lib/pkgconfig:/c/msys64/ucrt64/lib/pkgconfig'
-$cmds = @(
+New-Item -ItemType Directory -Force -Path "$REPO\build\qemu" | Out-Null
+
+$PKG = '/d/reims/reims-vgpu-windows-native-tahoe/.work/target/dist-vulkan/lib/pkgconfig:/c/msys64/ucrt64/lib/pkgconfig'
+
+$cmd = @(
   'export PATH=/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH',
   'export MSYSTEM=UCRT64',
   'cd /d/reims/reims-vgpu-windows-native-tahoe/build/qemu',
-  "export PKG_CONFIG_PATH=$pkgPath",
+  "export PKG_CONFIG_PATH=$PKG",
   'export WINDRES=llvm-windres CC_LD=lld CXX_LD=lld',
   ('../../vendor/qemu/configure --target-list=x86_64-softmmu ' +
    '--cc=clang --cxx=clang++ --extra-ldflags=-fuse-ld=lld ' +
-   '--enable-whpx --disable-kvm --disable-hvf ' +
-   '--enable-pvg ' +                       # ★ 虚拟 GPU 开关
+   '--enable-whpx --disable-kvm --disable-hvf --enable-pvg ' +
    '--enable-libusb --enable-sdl --enable-slirp ' +
    '--disable-gtk --disable-vnc --disable-spice ' +
    '--disable-gnutls --disable-curses --disable-nettle ' +
@@ -447,10 +873,23 @@ $cmds = @(
   'echo CONFIGURE_EXIT=$?'
 ) -join ' ; '
 
-& $bash -lc $cmds
+& $bash -lc $cmd
 ```
 
-**configure 成功的标志**：
+**configure 阶段不设置 `MSYS2_ARG_CONV_EXCL`**。原因：configure 内部调用 `cygpath` 转换路径，外部禁用转换会使 `/d/reims` 被拼成 `D:/d/reims`，导致 `python venv creation failed`。
+
+**参数说明**：
+
+| 参数 | 作用 |
+|---|---|
+| `--enable-pvg` | 启用 `apple-gfx` 虚拟 GPU（对应 meson 选项 `pvg`） |
+| `--enable-whpx` | 启用 Windows Hypervisor Platform 加速 |
+| `--disable-kvm --disable-hvf` | Windows 环境不需要 |
+| `--disable-gtk --disable-vnc --disable-spice` | 减少依赖，显示由 reims-vgpu 管理 |
+| `--disable-rust` | QEMU 自身的 Rust 组件，不需要 |
+| `--enable-sdl --enable-slirp --enable-libusb` | 窗口、用户态网络、USB 设备 |
+
+**成功标志**：
 
 ```
 pvg                             : enabled
@@ -461,10 +900,12 @@ sdl                             : enabled
 CONFIGURE_EXIT=0
 ```
 
-**然后编译**（写个脚本文件，避免 `bash -lc` 参数传递问题）：
+### 10.2 编译
+
+创建脚本文件（避免 `bash -lc` 多行参数传递问题）：
 
 ```powershell
-$scriptContent = @'
+$script = @'
 #!/bin/bash
 export PATH=/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH
 export MSYSTEM=UCRT64
@@ -476,133 +917,240 @@ code=$?
 echo "=== NINJA_EXIT=$code $(date) ==="
 exit $code
 '@
-[System.IO.File]::WriteAllText("$repo\build-qemu.sh", ($scriptContent -replace "`r`n","`n"), (New-Object System.Text.UTF8Encoding($false)))
 
-# 后台跑（约 40-90 分钟）
-Start-Process -FilePath 'C:\msys64\usr\bin\bash.exe' -ArgumentList "$repo\build-qemu.sh" `
-    -RedirectStandardOutput "$repo\.work\qemu-build.log" `
-    -RedirectStandardError "$repo\.work\qemu-build.err" `
-    -WindowStyle Hidden
+[System.IO.File]::WriteAllText(
+  "$REPO\build-qemu.sh",
+  ($script -replace "`r`n", "`n"),
+  (New-Object System.Text.UTF8Encoding($false))
+)
 ```
 
-**预期产物**：
-
-```
-build\qemu\qemu-system-x86_64.exe    71 MB
-build\qemu\qemu-img.exe              11 MB
-build\qemu\qemu-io.exe               11 MB
-```
-
-**★ 编译完必须复制两个文件到 `build\qemu\`**（否则 QEMU 启动时 `0xC0000135` DLL_NOT_FOUND）：
+后台执行（预计 40–90 分钟）：
 
 ```powershell
-$dist = "$repo\.work\target\dist-vulkan"
-Copy-Item "$dist\lib\reims_vgpu_c.dll"            "$repo\build\qemu\" -Force
-Copy-Item "$dist\share\reims-vgpu\ReimsVgpu.rom"  "$repo\build\qemu\" -Force
+Start-Process -FilePath 'C:\msys64\usr\bin\bash.exe' `
+  -ArgumentList "$REPO\build-qemu.sh" `
+  -RedirectStandardOutput "$REPO\.work\qemu-build.log" `
+  -RedirectStandardError  "$REPO\.work\qemu-build.err" `
+  -WindowStyle Hidden
 ```
 
-**验证**：
+**监控进度**：
 
 ```powershell
-$env:PATH = "C:\msys64\ucrt64\bin;$repo\build\qemu;$env:PATH"
-& "$repo\build\qemu\qemu-system-x86_64.exe" --version    # QEMU emulator version 11.1.50
-& "$repo\build\qemu\qemu-system-x86_64.exe" -device help | Select-String 'apple-gfx'
-# 应该看到：name "apple-gfx-pci", bus PCI, desc "macOS Paravirtualized Graphics PCI Display Controller"
-& "$repo\build\qemu\qemu-system-x86_64.exe" -accel help   # 应该列出 tcg 和 whpx
+Get-Content "$REPO\.work\qemu-build.log" -Tail 1
+# 输出形如：[1716/1716] Linking target qemu-system-x86_64.exe
+```
+
+**成功标志**：
+
+```
+[1716/1716] Linking target qemu-system-x86_64.exe
+=== NINJA_EXIT=0 ===
+```
+
+### 10.3 复制运行时依赖
+
+```powershell
+$REPO = 'D:\reims\reims-vgpu-windows-native-tahoe'
+$DIST = "$REPO\.work\target\dist-vulkan"
+
+Copy-Item "$DIST\lib\reims_vgpu_c.dll"           "$REPO\build\qemu\" -Force
+Copy-Item "$DIST\share\reims-vgpu\ReimsVgpu.rom" "$REPO\build\qemu\" -Force
+```
+
+**必做的原因**：`qemu-system-x86_64.exe` 启动时加载 `reims_vgpu_c.dll`。文件不在同目录时退出码为 `-1073741515`（`0xC0000135`，STATUS_DLL_NOT_FOUND），无任何错误输出。
+
+### 10.4 验证
+
+```powershell
+$REPO = 'D:\reims\reims-vgpu-windows-native-tahoe'
+$env:PATH = "C:\msys64\ucrt64\bin;$REPO\build\qemu;$env:PATH"
+
+& "$REPO\build\qemu\qemu-system-x86_64.exe" --version
+# 期望：QEMU emulator version 11.1.50
+
+& "$REPO\build\qemu\qemu-system-x86_64.exe" -device help | Select-String 'apple-gfx'
+# 期望：name "apple-gfx-pci", bus PCI, desc "macOS Paravirtualized Graphics PCI Display Controller"
+
+& "$REPO\build\qemu\qemu-system-x86_64.exe" -accel help
+# 期望列出：tcg、whpx
 ```
 
 ---
 
-### 3.9 准备 OpenCore 引导盘
+## 步骤 10：修改 OpenCore 生成脚本
 
-**★ 编译完 reims 后，必须先改脚本里的三个默认值**（否则会踩第 4 节里的循环坑）。
+**目的**：修正脚本中三个默认值。不修改会导致 OpenCore 无法识别任何磁盘。
 
-编辑 `scripts\windows\prepare-opencore.ps1`：
+**修改对象**：`scripts\windows\prepare-opencore.ps1`
+
+**修改内容**：
+
+| 行 | 原始值 | 修改为 | 原因 |
+|---|---|---|---|
+| Boot 段 | `HideAuxiliary=False, Timeout=0` | `HideAuxiliary=False, Timeout=20, ShowPicker=True` | Timeout=0 导致菜单一闪而过，无法手动选择安装盘 |
+| Security 段 | `ScanPolicy=0x301` | `ScanPolicy=0` | 0x301 缺少 `OC_SCAN_ALLOW_DEVICE_SATA`（bit 16），QEMU 磁盘全部挂载在 SATA，导致扫描结果为空 |
+
+**执行修改**：
 
 ```powershell
 $script = 'D:\reims\reims-vgpu-windows-native-tahoe\scripts\windows\prepare-opencore.ps1'
+
 Copy-Item $script "$script.bak" -Force
 
 $txt = [System.IO.File]::ReadAllText($script)
-# ① 菜单：显示 20 秒（方便手动选安装盘）
+
 $txt = $txt -replace [regex]::Escape("c['Misc']['Boot'].update(HideAuxiliary=False, Timeout=0)"), `
                        "c['Misc']['Boot'].update(HideAuxiliary=False, Timeout=20, ShowPicker=True)"
-# ② ScanPolicy：原来 0x301 缺 SATA 设备位，扫不到 QEMU 的磁盘
+
 $txt = $txt -replace 'ScanPolicy=0x301', 'ScanPolicy=0'
-# ★ 文件必须 UTF-8 无 BOM（带 BOM 会让含中文的脚本语法报错）
+
 [System.IO.File]::WriteAllText($script, $txt, (New-Object System.Text.UTF8Encoding($false)))
 ```
 
-**然后生成 OpenCore**：
+**编码说明**：必须使用 `UTF8Encoding($false)`（无 BOM）。使用 `UTF8Encoding($true)` 会给含中文的脚本添加 BOM，导致 PowerShell 报 `ParserError`。
+
+**验证修改**：
 
 ```powershell
-$repo  = 'D:\reims\reims-vgpu-windows-native-tahoe'
+Select-String -Path $script -Pattern "Misc'\]\['Boot'\]\.update|ScanPolicy="
+# 期望输出：
+#   L60: c['Misc']['Boot'].update(HideAuxiliary=False, Timeout=20, ShowPicker=True)
+#   L64: c['Misc']['Security'].update(ScanPolicy=0, SecureBootModel='x86legacy', ...)
+```
+
+**ScanPolicy 位定义参考**：
+
+| 位 | 值 | 常量 | 含义 |
+|---|---|---|---|
+| 0 | 1 | `OC_SCAN_FILE_SYSTEM_LOCK` | 启用文件系统白名单 |
+| 1 | 2 | `OC_SCAN_DEVICE_LOCK` | 启用设备白名单（设置其他设备位时必须启用） |
+| 8 | 256 | `OC_SCAN_ALLOW_FS_APFS` | 允许 APFS |
+| 9 | 512 | `OC_SCAN_ALLOW_FS_HFS` | 允许 HFS+ |
+| 10 | 1024 | `OC_SCAN_ALLOW_FS_ESP` | 允许 EFI 分区 |
+| 13 | 8192 | `OC_SCAN_ALLOW_FS_FAT` | 允许 FAT |
+| 16 | 65536 | `OC_SCAN_ALLOW_DEVICE_SATA` | 允许 SATA 设备 |
+| 19 | 524288 | `OC_SCAN_ALLOW_DEVICE_NVME` | 允许 NVMe 设备 |
+
+`0x301` = 769 = `LOCK(1) + APFS(256) + HFS(512)`，无 SATA 位。
+`0` = 不限制，扫描全部。
+
+---
+
+## 步骤 11：生成 OpenCore 引导盘
+
+**前置操作**（关键）：删除已有的 `config.plist`。
+
+```powershell
+$REPO = 'D:\reims\reims-vgpu-windows-native-tahoe'
+Remove-Item "$REPO\vm\firmware\opencore-1.0.8\root\EFI\OC\config.plist" -Force -ErrorAction SilentlyContinue
+```
+
+**原因**：脚本逻辑为：
+
+```powershell
+$plist = Join-Path $efiRoot 'EFI/OC/config.plist'
+if (!(Test-Path -LiteralPath $plist)) {    # 仅在文件不存在时生成
+    ... 从 Docs/Sample.plist 生成 config ...
+}
+```
+
+文件已存在时脚本跳过生成，导致步骤 10 的修改不生效。
+
+**执行生成**：
+
+```powershell
+$REPO  = 'D:\reims\reims-vgpu-windows-native-tahoe'
 $pwsh7 = 'C:\Program Files\PowerShell\7\pwsh.exe'
 
-Set-Location $repo
+Set-Location $REPO
 $env:REIMS_MSYS2_ROOT = 'C:\msys64'
 $env:RUSTUP_TOOLCHAIN = '1.98.1-x86_64-pc-windows-gnu'
 $env:PATH = "C:\msys64\ucrt64\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
 
-& $pwsh7 -NoProfile -ExecutionPolicy Bypass -File "$repo\scripts\windows\prepare-opencore.ps1" `
+& $pwsh7 -NoProfile -ExecutionPolicy Bypass -File "$REPO\scripts\windows\prepare-opencore.ps1" `
     -Version 1.0.8 `
     -FirmwareDirectory 'C:\msys64\ucrt64\share\qemu' `
     -Rebuild
 ```
 
-**预期产物**：
+**参数说明**：
 
-```
-vm\firmware\
-├── OVMF_CODE.fd                 3.48 MB
-├── OVMF_VARS.template.fd        0.52 MB
-└── opencore-1.0.8\
-    ├── OpenCore.img             504 MB   ← 引导盘
-    └── root\EFI\...
-```
+| 参数 | 作用 |
+|---|---|
+| `-Version 1.0.8` | OpenCore 版本（脚本从 GitHub 下载） |
+| `-FirmwareDirectory` | OVMF 所在目录。脚本默认查找 `D:\msys64`、`C:\msys64`、`build\qemu\pc-bios`，本环境需显式指定 |
+| `-Rebuild` | 强制重新打包 `OpenCore.img` |
 
-**验证 img 里的配置**（很重要，确认改动进去了）：
-
-```powershell
-$py  = 'C:\Users\<你>\AppData\Local\Programs\Python\Python311\python.exe'
-$tmp = "$repo\.work\imgcheck"
-New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-& 'D:\7-Zip\7z.exe' e "$repo\vm\firmware\opencore-1.0.8\OpenCore.img" -o"$tmp" 'EFI/OC/config.plist' -y | Out-Null
-
-& $py -c "import plistlib; p=plistlib.load(open(r'$tmp\config.plist','rb')); print('ScanPolicy =', p['Misc']['Security']['ScanPolicy']); print('Timeout =', p['Misc']['Boot']['Timeout'])"
-# 期望：ScanPolicy = 0, Timeout = 20
-```
-
----
-
-### 3.10 准备虚拟机磁盘
-
-```powershell
-$repo  = 'D:\reims\reims-vgpu-windows-native-tahoe'
-$pwsh7 = 'C:\Program Files\PowerShell\7\pwsh.exe'
-$iso   = 'D:\path\to\macOS-Sequoia-15.3.iso'      # ← 换成你的镜像路径
-
-Set-Location $repo
-$env:REIMS_MSYS2_ROOT = 'C:\msys64'
-$env:PATH = "C:\msys64\ucrt64\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
-
-# 第一步：只检查镜像（不创建任何东西）
-& $pwsh7 -NoProfile -ExecutionPolicy Bypass -File "$repo\scripts\windows\prepare-vm.ps1" `
-    -Iso $iso -InspectOnly -SevenZip 'D:\7-Zip\7z.exe'
-
-# 第二步：正式准备（创建 128 GB qcow2 磁盘）
-& $pwsh7 -NoProfile -ExecutionPolicy Bypass -File "$repo\scripts\windows\prepare-vm.ps1" `
-    -Iso $iso `
-    -SevenZip 'D:\7-Zip\7z.exe' `
-    -QemuImg "$repo\build\qemu\qemu-img.exe" `
-    -DiskGiB 128
-```
-
-**`-InspectOnly` 的期望输出**：
+**预期输出**：
 
 ```json
 {
-  "path": "...",
+  "schema": 1,
+  "version": "1.0.8",
+  "image": "...vm\\firmware\\opencore-1.0.8\\OpenCore.img",
+  "image_sha256": "...",
+  "config": "...root\\EFI\\OC\\config.plist",
+  "config_sha256": "...",
+  "ocvalidate": "...ocvalidate.exe",
+  "firmware_code": "...vm\\firmware\\OVMF_CODE.fd",
+  "firmware_vars_template": "...vm\\firmware\\OVMF_VARS.template.fd",
+  "firmware_source": "C:\\msys64\\ucrt64\\share\\qemu",
+  "validated": true
+}
+```
+
+`validated: true` 表示 `ocvalidate` 校验通过。
+
+**验证 img 内的配置已更新**：
+
+```powershell
+$REPO = 'D:\reims\reims-vgpu-windows-native-tahoe'
+$py   = 'C:\Users\<用户名>\AppData\Local\Programs\Python\Python311\python.exe'
+$tmp  = "$REPO\.work\imgcheck"
+
+New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+& 'D:\7-Zip\7z.exe' e "$REPO\vm\firmware\opencore-1.0.8\OpenCore.img" -o"$tmp" 'EFI/OC/config.plist' -y | Out-Null
+
+& $py -c "import plistlib; p=plistlib.load(open(r'$tmp\config.plist','rb')); print('ScanPolicy =', p['Misc']['Security']['ScanPolicy']); print('Timeout =', p['Misc']['Boot']['Timeout'])"
+
+# 期望：
+#   ScanPolicy = 0
+#   Timeout = 20
+```
+
+**警告**：不要尝试直接修改 `root/EFI/OC/config.plist` 后单独更新 `OpenCore.img`。7-Zip 不支持更新 FAT 镜像（`System ERROR: 未实现`），`pyfatfs` 无法解析带 MBR 分区表的镜像（`Boot code must start with 0xEB or 0xE9`）。唯一可行方式是修改脚本后重新执行 `-Rebuild`。
+
+---
+
+## 步骤 12：准备虚拟机磁盘
+
+**目的**：创建 128 GB qcow2 磁盘，并建立与安装镜像的关联。
+
+```powershell
+$REPO  = 'D:\reims\reims-vgpu-windows-native-tahoe'
+$pwsh7 = 'C:\Program Files\PowerShell\7\pwsh.exe'
+$ISO   = 'D:\images\macOS-Sequoia-15.3.iso'
+
+Set-Location $REPO
+$env:REIMS_MSYS2_ROOT = 'C:\msys64'
+$env:PATH = "C:\msys64\ucrt64\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
+
+# 第一步：仅检查镜像格式，不创建任何文件
+& $pwsh7 -NoProfile -ExecutionPolicy Bypass -File "$REPO\scripts\windows\prepare-vm.ps1" `
+    -Iso $ISO `
+    -InspectOnly `
+    -SevenZip 'D:\7-Zip\7z.exe'
+```
+
+**检查阶段预期输出**：
+
+```json
+{
+  "schema": 1,
+  "path": "D:\\images\\macOS-Sequoia-15.3.iso",
+  "bytes": 17578328064,
   "container": "APM/HFS+",
   "media_kind": "disk",
   "boot_architecture": "x86_64",
@@ -611,7 +1159,25 @@ $env:PATH = "C:\msys64\ucrt64\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
 }
 ```
 
-**正式准备的期望输出**：
+**字段含义**：
+
+| 字段 | 说明 |
+|---|---|
+| `container` | `APM/HFS+` 或 `ISO9660` |
+| `media_kind` | `disk`（作为硬盘挂载）或 `cdrom`（作为光驱挂载） |
+| `boot_architecture` | 必须为 `x86_64`。`arm64` 镜像无法在 x86 宿主运行 |
+
+**创建磁盘**：
+
+```powershell
+& $pwsh7 -NoProfile -ExecutionPolicy Bypass -File "$REPO\scripts\windows\prepare-vm.ps1" `
+    -Iso $ISO `
+    -SevenZip 'D:\7-Zip\7z.exe' `
+    -QemuImg "$REPO\build\qemu\qemu-img.exe" `
+    -DiskGiB 128
+```
+
+**预期输出**：
 
 ```json
 {
@@ -619,10 +1185,12 @@ $env:PATH = "C:\msys64\ucrt64\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
   "memory_mib": 8192,
   "resolution": "1920x1080",
   "disk_gib": 128,
-  "cpu": "Haswell-noTSX,...+avx2,+aes,...",
+  "cpu": "Haswell-noTSX,stepping=3,vendor=GenuineIntel,+ssse3,+sse4.2,+popcnt,+avx,+avx2,+aes,+xsave,+xsaveopt,-arat,enforce",
   "mac": "52:54:00:xx:xx:xx",
   "qmp_port": 4444,
   "ssh_port": 2222,
+  "iso": "D:\\images\\macOS-Sequoia-15.3.iso",
+  "media_kind": "disk",
   "base_disk": "...vm\\disks\\base.qcow2",
   "active_disk": "...vm\\disks\\current.qcow2",
   "opencore": "...OpenCore.img",
@@ -632,30 +1200,51 @@ $env:PATH = "C:\msys64\ucrt64\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
 }
 ```
 
+**CPU 型号说明**：`Haswell-noTSX` 提供 AVX2 / F16C / RDRAND，满足 macOS 要求，同时避免暴露宿主机真实 CPU 特性差异。可修改 `vm\state\config.json` 中的 `cpu` 字段。
+
+**修改虚拟机配置**：编辑 `vm\state\config.json`：
+
+```json
+{
+  "cpus": 8,           // 可改为物理核心数
+  "memory_mib": 8192,  // 可改为 16384
+  "resolution": "1920x1080"
+}
+```
+
 ---
 
-### 3.11 启动并安装 macOS
+## 步骤 13：启动并安装 macOS
 
-**启动**：
+### 13.1 启动
 
 ```powershell
-$repo  = 'D:\reims\reims-vgpu-windows-native-tahoe'
+$REPO  = 'D:\reims\reims-vgpu-windows-native-tahoe'
 $pwsh7 = 'C:\Program Files\PowerShell\7\pwsh.exe'
 
-Set-Location $repo
+Set-Location $REPO
 $env:REIMS_MSYS2_ROOT = 'C:\msys64'
 $env:PATH = "C:\msys64\ucrt64\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
 
-& $pwsh7 -NoProfile -ExecutionPolicy Bypass -File "$repo\scripts\windows\start.ps1"
+& $pwsh7 -NoProfile -ExecutionPolicy Bypass -File "$REPO\scripts\windows\start.ps1"
 ```
 
-会弹出一个 **Reims vGPU** 窗口，显示 OpenCore 菜单：
+**预期输出**：
+
+```
+Started PID <pid>, QMP 127.0.0.1:4444, SSH 127.0.0.1:2222.
+Logs: D:\reims\...\vm\logs\<时间戳>
+```
+
+同时弹出标题为 `Reims vGPU` 的窗口。
+
+**窗口显示内容**：
 
 ```
 OpenCore Boot Menu (REL-108-2026-09-27)
 
   1. QEMU VVFAT
-  2. Install macOS Sequoia [xxx]
+  2. Install macOS Sequoia [<卷标>]
   3. Recovery 15.3 (dmg)
 
 |Shutdown|  |Restart|
@@ -663,601 +1252,231 @@ OpenCore Boot Menu (REL-108-2026-09-27)
 Choose the Operating System: Timeout
 ```
 
-**★ 键盘输入的坑**：Reims vGPU 窗口的键盘事件可能不转发给 guest。用 **QMP HMP sendkey** 注入（见第 4.9 节）。
+| 菜单项 | 说明 |
+|---|---|
+| `QEMU VVFAT` | OpenCore 自身所在的 FAT 分区，不可选 |
+| `Install macOS Sequoia` | 安装镜像 |
+| `Recovery 15.3 (dmg)` | 安装镜像内的恢复分区 |
+| `Macintosh HD` | 安装完成后出现，系统盘 |
 
-**安装流程**：
+### 13.2 键盘输入
 
-1. **选 `Install macOS Sequoia`** → 回车
-2. 内核启动约 1–2 分钟，然后进入 **macOS 恢复界面**（图形）
-3. 点 **Disk Utility** → 选中 `QEMU HARDDISK`（128 GB）→ **Erase**
-   - Name: `Macintosh HD`
-   - Format: **APFS**
-   - Scheme: **GUID Partition Map**
-4. 关闭 Disk Utility，回到主界面
-5. 点 **Install macOS Sequoia** → **Continue**
-6. 选 `Macintosh HD` → 开始安装（**20–40 分钟**，会自动重启）
-7. **重启后如果回到 OpenCore 菜单**，选 **`Macintosh HD`** 继续
-8. 装完后进入 **首次设置向导**
-9. 完成设置 → **桌面**
+窗口可能不转发键盘事件到 guest。使用 QMP 的 HMP 接口注入按键：
 
-**这次实测的时间线**：
-
-```
-16:26  启动
-16:27  OpenCore 菜单 → 选 Install macOS
-16:28  内核启动
-16:29  macOS Recovery 图形界面
-17:01  安装完成，写入 32.5 GB，重启
-17:05  首次设置向导（Select Your Country or Region）
-```
-
----
-
-## 4. 踩过的坑（重点，能省你两天）
-
-> 这一节是整份文档最有价值的部分。每一个坑都实际踩过，有明确的症状和解决方案。
-
-### 4.1 MSYS2 安装器静默参数失败
-
-**症状**：
-```
-msys2-x86_64-20240113.exe in --confirm-command --root C:/msys64
-install exit=1
-```
-7z 也解不开（`Cannot open the file as archive`）。
-
-**原因**：MSYS2 用的是 Qt Installer Framework，静默参数不兼容。
-
-**解决**：用 **base tarball** + Windows 自带 `tar.exe` 解压（见 3.2）。
-
----
-
-### 4.2 Rust 默认工具链是 MSVC，缺 link.exe
-
-**症状**：
-```
-error: linker `link.exe` not found
-note: the msvc targets depend on the msvc linker but `link.exe` was not found
-```
-
-**原因**：`rustup` 默认装 `stable-x86_64-pc-windows-msvc`，需要 Visual Studio Build Tools。
-
-**解决**：
 ```powershell
-rustup toolchain install 1.98.1-x86_64-pc-windows-gnu
-rustup default 1.98.1-x86_64-pc-windows-gnu
-$env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = 'C:\msys64\ucrt64\bin\clang.exe'
-```
+function Send-Key {
+    param([string]$Key)   # up / down / left / right / ret / esc / space / tab / delete
 
----
+    $client = New-Object System.Net.Sockets.TcpClient
+    $client.Connect('127.0.0.1', 4444)
+    $stream = $client.GetStream()
+    $reader = New-Object System.IO.StreamReader($stream)
+    $writer = New-Object System.IO.StreamWriter($stream)
+    $writer.AutoFlush = $true
 
-### 4.3 `rust-toolchain.toml` 把工具链拉回 MSVC
+    Start-Sleep -Milliseconds 400
+    $reader.ReadLine() | Out-Null
 
-**症状**：明明 `rustup default` 设成 GNU 了，`cargo build` 还是报 MSVC linker 错误。
+    $writer.WriteLine('{"execute":"qmp_capabilities"}')
+    Start-Sleep -Milliseconds 200
+    $reader.ReadLine() | Out-Null
 
-**原因**：仓库的 `rust-toolchain.toml` 写的是：
-```toml
-[toolchain]
-channel = "1.98.1"      ← 没指定 target，rustup 按默认 host（MSVC）解析
-targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-apple-darwin"]
-```
+    $writer.WriteLine('{"execute":"human-monitor-command","arguments":{"command-line":"sendkey ' + $Key + '"}}')
+    Start-Sleep -Milliseconds 400
+    $reader.ReadLine() | Out-Null
 
-**解决**：**用环境变量强制覆盖**（`environment.ps1` 就是这么干的）：
-```powershell
-$env:RUSTUP_TOOLCHAIN = '1.98.1-x86_64-pc-windows-gnu'
-$env:RUSTUP_AUTO_INSTALL = '0'
-```
-
----
-
-### 4.4 firmware 编译：MSYS2 把 `/nologo` 当成路径
-
-**症状**：
-```
-lld-link: error: could not open 'C:/msys64/nologo': No such file or directory
-lld-link: error: could not open 'C:/msys64/dll': No such file or directory
-lld-link: error: could not open 'C:/msys64/driver': No such file or directory
-```
-
-**原因**：MSYS2 的路径转换把 `/xxx` 形式的 Windows 命令行参数误认为 Unix 路径。
-
-**解决**：设 `MSYS2_ARG_CONV_EXCL=*`：
-```bash
-export MSYS2_ARG_CONV_EXCL=*
-```
-
-**★ 但会引出下一个坑**：
-
----
-
-### 4.5 `MSYS2_ARG_CONV_EXCL=*` 又让文件路径失效
-
-**症状**：
-```
-lld-link: error: could not open '/d/reims/.../ReimsVgpu.obj': No such file or directory
-```
-（文件明明存在）
-
-**原因**：`ARG_CONV_EXCL=*` 同时也禁用了路径转换，`lld-link` 是 Windows 程序，不认 `/d/...` 这种 Unix 路径。
-
-**解决**：**BUILD 参数用 Windows 混合路径**（`cygpath -m` 的效果）：
-```bash
-# 错误
-BUILD=/d/reims/.../firmware
-# 正确（Windows 程序能认）
-BUILD=D:/reims/.../firmware
-```
-
----
-
-### 4.6 `configure` 时设了 `ARG_CONV_EXCL` 导致路径变成 `D:/d/reims`
-
-**症状**：
-```
-C:/msys64/ucrt64/bin/python3.exe: can't open file 'D:/d/reims/.../python/scripts/mkvenv.py'
-ERROR: python venv creation failed
-```
-
-**原因**：`configure` 内部自己调用 `cygpath` 处理路径，外部禁用转换后，`/d/reims` 被当成相对路径拼成了 `D:/d/reims`。
-
-**解决**：**configure 阶段不要设 `MSYS2_ARG_CONV_EXCL`**，只在 `make`/`ninja` 阶段设。
-
----
-
-### 4.7 pkg-config 找不到 reims-vgpu
-
-**症状**：
-```
-Found pkg-config: YES (C:\msys64\ucrt64\bin/pkg-config.exe) 3.0.10
-Run-time dependency reims-vgpu found: NO (tried pkg-config)
-ERROR: Dependency "reims-vgpu" not found (tried pkg-config)
-```
-
-**两个原因**：
-1. **`PKG_CONFIG_PATH` 用了 `D:/...` 格式** → 改用 MSYS2 格式 `/d/...`
-2. **`.pc` 文件里 `Libs: -lreims_vgpu_c.dll`** → `pkg-config --exists` 会**卡死**，改成 `-lreims_vgpu_c`
-
-**解决**：
-```powershell
-$env:PKG_CONFIG_PATH = '/d/reims/.../dist-vulkan/lib/pkgconfig:/c/msys64/ucrt64/lib/pkgconfig'
-# 并手改 .pc 文件去掉 .dll 后缀
-```
-
-**验证**：
-```bash
-pkg-config --exists reims-vgpu; echo "exit=$?"    # 必须是 0
-pkg-config --libs reims-vgpu                     # 应该输出 -lreims_vgpu_c
-```
-
----
-
-### 4.8 `QEMU 0xC0000135` (DLL_NOT_FOUND)
-
-**症状**：`qemu-system-x86_64.exe --version` 退出码 `-1073741515`（0xC0000135），无任何输出。
-
-**原因**：`reims_vgpu_c.dll` 不在 `build\qemu\` 目录，也不在 PATH 里。
-
-**解决**：
-```powershell
-Copy-Item "$repo\.work\target\dist-vulkan\lib\reims_vgpu_c.dll" "$repo\build\qemu\" -Force
-Copy-Item "$repo\.work\target\dist-vulkan\share\reims-vgpu\ReimsVgpu.rom" "$repo\build\qemu\" -Force
-```
-
----
-
-### 4.9 ★ `OCB: System has no boot entries` —— 最耗时的坑
-
-**症状**：
-```
-BdsDxe: starting Boot0001 "UEFI QEMU HARDDISK QM00017 " from Sata(0x2,...)
-00:000 00:000 OCB: System has no boot entries
-00:002 00:002 OC: Failed to show boot menu!
-Halting on critical error
-```
-
-**根因链**（这里有三个独立的坑）：
-
-#### 坑 A：`ScanPolicy = 0x301` 缺 SATA 设备位
-
-OpenCore 的 `ScanPolicy` 是位掩码：
-```
-769 = 0x301 = 0b0011_0000_0001
-  bit 0  (1)     = OC_SCAN_FILE_SYSTEM_LOCK    ✓
-  bit 8  (256)   = OC_SCAN_ALLOW_FS_APFS       ✓
-  bit 9  (512)   = OC_SCAN_ALLOW_FS_HFS        ✓
-  bit 16 (65536) = OC_SCAN_ALLOW_DEVICE_SATA   ✗ 缺失！
-```
-
-**允许 HFS+/APFS 但不允许扫描 SATA 总线** —— 而 QEMU 把磁盘全挂在 SATA（`sata.2` OpenCore、`sata.3` 系统盘、`sata.4` 安装盘），所以一个都看不见。
-
-**解决**：`ScanPolicy = 0`（全允许）或 `66307`（LOCK+DEVICE_LOCK+APFS+HFS+SATA）
-
-#### 坑 B：`prepare-opencore.ps1 -Rebuild` 会覆盖你的 config
-
-**症状**：手改 `root\EFI\OC\config.plist` 后跑 `-Rebuild`，改动静默失效。
-
-**原因**：脚本从 `Sample.plist` 重新生成 config，值写死在脚本里：
-```python
-c['Misc']['Boot'].update(HideAuxiliary=False, Timeout=0)
-c['Misc']['Security'].update(ScanPolicy=0x301, ...)
-```
-
-**解决**：**改脚本本身**（见 3.9）。
-
-#### 坑 C：`config.plist` 已存在 → 脚本跳过生成
-
-**症状**：改了脚本，跑 `-Rebuild`，config 还是旧值。
-
-**原因**：
-```powershell
-if (!(Test-Path -LiteralPath $plist)) {    ← 只看存不存在！
-    ... 生成 config ...
+    $client.Close()
 }
+
+Send-Key 'down'
+Send-Key 'ret'
 ```
 
-**解决**：**先删掉 config.plist，再 `-Rebuild`**：
-```powershell
-Remove-Item "$repo\vm\firmware\opencore-1.0.8\root\EFI\OC\config.plist" -Force
-# 然后跑 -Rebuild
-```
+**不使用 QMP 的 `send-key`**。该命令将按键发送到 PS/2 控制器（`i8042`），本环境未配置 PS/2 键盘设备，指令无效。
 
-#### 坑 D：用带 BOM 的 UTF8 写回脚本
+**不使用 QMP 的 `input-send-event`**。该命令在 `-display none` 模式下触发 QEMU 缺陷并崩溃：
 
-**症状**：
-```
-ParserError: prepare-opencore.ps1:147
-```
-
-**原因**：脚本含中文，用 `UTF8Encoding($true)`（带 BOM）写回会破坏语法。
-
-**解决**：永远用 `UTF8Encoding($false)`（无 BOM）：
-```powershell
-[System.IO.File]::WriteAllText($path, $content, (New-Object System.Text.UTF8Encoding($false)))
-```
-
----
-
-### 4.10 改 `root/config.plist` 但 img 没更新
-
-**症状**：改了 `root\EFI\OC\config.plist`，QEMU 里行为没变。
-
-**原因**：QEMU 用的是 `OpenCore.img`（打包好的 FAT 镜像），不是 `root\` 目录。
-
-**7z 无法更新**：`7z u OpenCore.img EFI/OC/config.plist` → `System ERROR: 未实现`
-
-**`pyfatfs` 也不行**：`Boot code must start with 0xEB or 0xE9. Is this a FAT partition?`（img 有 MBR 分区表）
-
-**解决**：**只用官方的 `-Rebuild` 重新打包**（脚本内部用 `qemu-img convert -f vvfat -O raw fat:<efiRoot>`）。
-
-**所以**：改 config 的正确姿势是 **改脚本 → 删 config → -Rebuild**，而不是直接改 config 文件。
-
----
-
-### 4.11 键盘输入没反应
-
-**症状**：OpenCore 菜单里方向键不动；QMP `send-key` 也没用。
-
-**原因**：
-- QEMU 配了 `-display none`（显示由 reims-vgpu 自己管）
-- 唯一的键盘是 `-device usb-kbd,id=kbd`
-- **QMP 的 `send-key` 默认发到 PS/2（i8042）**，而 guest 没有 PS/2 键盘
-
-**解决**：用 **HMP 的 `sendkey`**（走 QEMU monitor，能正确路由）：
-
-```python
-# 通过 QMP 调 HMP
-{"execute":"human-monitor-command",
- "arguments":{"command-line":"sendkey down"}}
-```
-
-**实测有效**：
-```
-up : {"return": ""}
-ret: {"return": ""}
-→ 菜单星号移动，回车生效
-```
-
-**★ 不要用 `input-send-event`**：在 `-display none` 模式下会崩溃：
 ```
 Unexpected error in object_property_find_err() at qom/object.c:1455:
 Property 'qemu-fixed-text-console.device' not found
 ```
 
----
+### 13.3 安装流程
 
-### 4.12 安装到一半重启回到 OpenCore 菜单
-
-**症状**：安装器显示"剩余 22 分钟"，然后闪一下回到菜单。
-
-**不是故障**：macOS 安装本来就会重启多次。但 OpenCore 不会自动继续。
-
-**解决**：**重启后在菜单里选 `Macintosh HD`**（安装完成后它会出现在菜单里）。
-
-本次实测：安装器写了 32.5 GB 后重启，选 Macintosh HD 就进了首次设置向导。
-
----
-
-## 5. 文件清单
-
-### 5.1 完整目录结构（编译后）
-
-```
-D:\reims\
-├── reims-vgpu-windows-native-tahoe.zip
-├── qemu.zip
-└── reims-vgpu-windows-native-tahoe\
-    ├── Cargo.toml
-    ├── rust-toolchain.toml
-    ├── scripts\
-    │   └── windows\
-    │       ├── prepare-opencore.ps1       ← 需改 3 处（ScanPolicy/Timeout/）
-    │       ├── prepare-vm.ps1
-    │       ├── start.ps1
-    │       ├── stop.ps1
-    │       ├── doctor.ps1                 ← 环境自检
-    │       ├── snapshot.ps1
-    │       ├── environment.ps1            ← MsysRoot 默认 D:\msys64，需覆盖
-    │       └── ucrt64.cmake
-    ├── vendor\
-    │   └── qemu\                          ← QEMU 源码（139 MB, 11438 文件）
-    │       ├── configure
-    │       ├── meson.build
-    │       └── hw\display\apple-gfx*.c    ← 虚拟 GPU 实现
-    ├── build\
-    │   └── qemu\
-    │       ├── qemu-system-x86_64.exe     ← 71 MB
-    │       ├── qemu-img.exe               ← 11 MB
-    │       ├── qemu-io.exe                ← 11 MB
-    │       ├── reims_vgpu_c.dll           ← 191 MB（必须复制到这）
-    │       └── ReimsVgpu.rom              ← 5.5 KB（必须复制到这）
-    ├── .work\
-    │   ├── target\
-    │   │   ├── dist-vulkan\
-    │   │   │   ├── lib\libreims_vgpu.a        606 MB
-    │   │   │   ├── lib\reims_vgpu_c.dll       191 MB
-    │   │   │   ├── lib\pkgconfig\reims-vgpu.pc
-    │   │   │   ├── include\reims_vgpu.h
-    │   │   │   └── share\reims-vgpu\ReimsVgpu.rom
-    │   │   └── firmware\
-    │   │       ├── ReimsVgpu.efi         5.3 KB
-    │   │       └── ReimsVgpu.rom         5.5 KB
-    │   ├── downloads\OpenCore-1.0.8\
-    │   └── logs\
-    └── vm\                                ← 虚拟机本体
-        ├── firmware\
-        │   ├── OVMF_CODE.fd              3.48 MB
-        │   ├── OVMF_VARS.fd              0.52 MB
-        │   ├── OVMF_VARS.template.fd     0.52 MB
-        │   └── opencore-1.0.8\
-        │       ├── OpenCore.img          504 MB
-        │       ├── ocvalidate.log
-        │       └── root\EFI\
-        │           ├── BOOT\BOOTx64.efi
-        │           └── OC\
-        │               ├── OpenCore.efi
-        │               ├── config.plist
-        │               └── Drivers\
-        │                   ├── OpenHfsPlus.efi       40 KB
-        │                   ├── OpenPartitionDxe.efi  40 KB
-        │                   └── OpenRuntime.efi       24 KB
-        ├── disks\
-        │   ├── base.qcow2                128 GB（稀疏）
-        │   └── current.qcow2             32 GB（装完系统后）
-        ├── state\
-        │   ├── config.json               VM 配置
-        │   ├── media.json                安装镜像记录
-        │   └── opencore.json             OpenCore 清单
-        └── logs\
-            └── 20261110-162614-149\
-                ├── command.json          完整 QEMU 命令行
-                ├── serial.log            OpenCore + macOS 内核日志
-                ├── stderr.log            ★ GPU 统计在这里
-                └── qmp-status.json
-```
-
-### 5.2 外部依赖（不在 reims 目录里）
-
-| 路径 | 用途 | 大小 |
+| 步骤 | 操作 | 预计耗时 |
 |---|---|---|
-| `C:\msys64\` | MSYS2 环境 | ~3 GB |
-| `C:\msys64\ucrt64\share\qemu\edk2-x86_64-code.fd` | OVMF UEFI 固件 | 3.48 MB |
-| `C:\msys64\ucrt64\share\qemu\edk2-i386-vars.fd` | OVMF NVRAM 模板 | 0.52 MB |
-| `C:\Users\<你>\.cargo\` | Rust 工具链 | ~1.5 GB |
-| `C:\Program Files\PowerShell\7\` | PowerShell 7 | ~200 MB |
-| `D:\7-Zip\7z.exe` | 7-Zip | — |
-| macOS 安装 ISO | Sequoia 15.3 (24D60) | 16.37 GB |
+| 1 | 选择 `Install macOS Sequoia`，回车 | — |
+| 2 | 内核启动（`-v` 详细模式，屏幕滚动日志） | 60–120 秒 |
+| 3 | 进入 macOS 恢复界面（图形） | — |
+| 4 | 打开 `Disk Utility` | — |
+| 5 | 选中 `QEMU HARDDISK`（128 GB） | — |
+| 6 | 点击 `Erase`，参数：Name=`Macintosh HD`，Format=`APFS`，Scheme=`GUID Partition Map` | 10–30 秒 |
+| 7 | 关闭 `Disk Utility` | — |
+| 8 | 选择 `Install macOS Sequoia` → `Continue` | — |
+| 9 | 选择 `Macintosh HD` | — |
+| 10 | 安装（进度条显示剩余时间） | 30–40 分钟 |
+| 11 | 自动重启 | — |
+| 12 | 若回到 OpenCore 菜单，选择 `Macintosh HD` | — |
+| 13 | 首次设置向导 | 5–10 分钟 |
+| 14 | 桌面 | — |
 
----
+### 13.4 设置向导
 
-## 6. 关键配置速查
+| 页面 | 建议选择 |
+|---|---|
+| Country or Region | China |
+| Language | 简体中文（可后续在 System Settings → General → Language & Region 修改） |
+| Accessibility | Not Now |
+| Network | 有线自动连接 |
+| Data & Privacy | Continue |
+| Transfer Your Data | Don't Transfer |
+| Apple ID | Set Up Later |
+| Terms and Conditions | Agree |
+| Create Computer Account | 用户名 + 密码（记录密码） |
+| Siri | 不启用 |
+| Analytics | 不共享 |
+| Appearance | 任意 |
 
-### 6.1 OpenCore `config.plist` 关键值
+### 13.5 验证 GPU 加速
 
-| 键 | 值 | 说明 |
-|---|---|---|
-| `Misc/Boot/Timeout` | `20` | 菜单等待 20 秒 |
-| `Misc/Boot/ShowPicker` | `True` | 显示菜单 |
-| `Misc/Boot/HideAuxiliary` | `False` | 显示 Recovery 等辅助项 |
-| `Misc/Security/ScanPolicy` | `0` | **全允许**（0x301 缺 SATA 位） |
-| `Misc/Security/SecureBootModel` | `x86legacy` | 兼容模式 |
-| `Misc/Security/HaltLevel` | `0x80000000` | 出错即 halt |
-| `Booter/Quirks/SetupVirtualMap` | `True` | |
-| `Booter/Quirks/RebuildAppleMemoryMap` | `True` | |
-| `Booter/Quirks/SyncRuntimePermissions` | `True` | |
-| `Booter/Quirks/EnableWriteUnprotector` | `False` | |
-| `Kernel/Emulate/DummyPowerManagement` | `True` | |
-| `Kernel/Add` | **空** | reims 不需要任何 kext |
-| `ACPI/Add` | **空** | |
-| `NVRAM boot-args` | `-v keepsyms=1 serial=3 debug=0x108` | |
-| `UEFI/Drivers` | OpenRuntime + OpenPartitionDxe + OpenHfsPlus | |
-| `UEFI/Input/KeySupport` | `True` | |
-| `UEFI/Input/KeyForgetThreshold` | `5` | |
-| `UEFI/Output/Resolution` | `1920x1080` | |
-
-### 6.2 QEMU 命令行关键参数
-
-从 `vm\logs\<时间戳>\command.json` 可以看到完整参数。关键几段：
-
-```
--accel whpx,hyperv=off                              ← WHPX 加速
--cpu Haswell-noTSX,stepping=3,vendor=GenuineIntel,
-     +ssse3,+sse4.2,+popcnt,+avx,+avx2,+aes,+xsave,+xsaveopt,-arat,enforce
--smp 8,sockets=1,cores=8,threads=1
--m 8192M
-
--device isa-applesmc,osk=ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc
-
--drive if=pflash,format=raw,readonly=on,file=...OVMF_CODE.fd
--drive if=pflash,format=raw,file=...OVMF_VARS.fd
-
--device ich9-ahci,id=sata,addr=0x2
--drive  id=opencore,...,file=...OpenCore.img
--device ide-hd,bus=sata.2,drive=opencore,bootindex=1
--drive  id=disk,format=qcow2,file=...current.qcow2
--device ide-hd,bus=sata.3,drive=disk,rotation_rate=1
--drive  id=installer,format=raw,snapshot=on,file=<你的ISO>
--device ide-hd,bus=sata.4,drive=installer
-
--vga none                                    ← ★ 不用 QEMU 自带显卡
--device {"driver":"apple-gfx-pci",           ← ★ 虚拟 Apple GPU
-         "id":"gfx","bus":"pcie.0","addr":"0x4",
-         "displays":1,"resolution":"1920x1080",
-         "romfile":".../ReimsVgpu.rom",
-         "display-modes":["1920x1080@60","1280x720@60",
-                          "2560x1440@60","3840x2160@60"]}
-
--device qemu-xhci,id=xhci,addr=0x5,p2=8,p3=6,conditional-intr-mapping=on
--device usb-kbd,id=kbd,bus=xhci.0
--device usb-tablet,id=tablet,bus=xhci.0
-
--netdev user,id=net0,ipv6=off,hostfwd=tcp:127.0.0.1:2222-:22
--device virtio-net-pci,netdev=net0,id=net0,mac=52:54:00:xx:xx:xx,addr=0x3
-
--display none                                ← 显示由 reims-vgpu 管
--qmp tcp:127.0.0.1:4444,server=on,wait=off
--serial file:.../serial.log
-```
-
-### 6.3 虚拟机配置（`vm\state\config.json`）
-
-```json
-{
-  "cpus": 8,
-  "memory_mib": 8192,
-  "resolution": "1920x1080",
-  "disk_gib": 128,
-  "mac": "52:54:00:xx:xx:xx",
-  "qmp_port": 4444,
-  "ssh_port": 2222
-}
-```
-
-**想调高配置**：改这个 JSON，然后 `stop.ps1` + `start.ps1`。
-
----
-
-## 7. 日常操作
-
-### 7.1 启动/停止
+**方法一：查看 GPU 统计日志**
 
 ```powershell
-$repo  = 'D:\reims\reims-vgpu-windows-native-tahoe'
-$pwsh7 = 'C:\Program Files\PowerShell\7\pwsh.exe'
-Set-Location $repo
-$env:REIMS_MSYS2_ROOT = 'C:\msys64'
-$env:PATH = "C:\msys64\ucrt64\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
-
-# 启动
-& $pwsh7 -NoProfile -ExecutionPolicy Bypass -File "$repo\scripts\windows\start.ps1"
-
-# 优雅停止（等 macOS 关机）
-& $pwsh7 -NoProfile -ExecutionPolicy Bypass -File "$repo\scripts\windows\stop.ps1"
-
-# 强制停止（丢弃未保存工作）
-& $pwsh7 -NoProfile -ExecutionPolicy Bypass -File "$repo\scripts\windows\stop.ps1" -Force
+$REPO = 'D:\reims\reims-vgpu-windows-native-tahoe'
+$latest = Get-ChildItem "$REPO\vm\logs" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+Get-Content "$latest\stderr.log" -Tail 5
 ```
 
-### 7.2 用 QMP 注入按键（键盘不响应时）
+预期输出：
 
-```powershell
-function Send-HmpKey {
-    param([string]$Key)   # up / down / ret / esc / space / tab
-    $c = New-Object System.Net.Sockets.TcpClient
-    $c.Connect('127.0.0.1', 4444)
-    $s = $c.GetStream()
-    $r = New-Object System.IO.StreamReader($s)
-    $w = New-Object System.IO.StreamWriter($s)
-    $w.AutoFlush = $true
-    Start-Sleep -Milliseconds 400
-    $r.ReadLine() | Out-Null
-    $w.WriteLine('{"execute":"qmp_capabilities"}')
-    Start-Sleep -Milliseconds 200
-    $r.ReadLine() | Out-Null
-    $w.WriteLine('{"execute":"human-monitor-command","arguments":{"command-line":"sendkey ' + $Key + '"}}')
-    Start-Sleep -Milliseconds 400
-    $r.ReadLine() | Out-Null
-    $c.Close()
-}
-
-Send-HmpKey 'down'
-Send-HmpKey 'ret'
+```
+reims-vgpu stats: port 0: guest 10.0/s, max gap 101.0 ms; window 10.0/s, max gap 100.9 ms; window GPU 2.09 ms avg, 2.67 ms max
 ```
 
-### 7.3 截取 guest 画面（不用看窗口）
+`window GPU X ms avg` 为每帧 GPU 渲染耗时。正常范围 1.8–3.3 ms。若该值为 `-`，表示当前无图形更新（静态画面）。
+
+**方法二：guest 内查询显示设备**
+
+在 macOS 终端执行：
+
+```bash
+system_profiler SPDisplaysDataType
+```
+
+预期输出包含：
+
+```
+Chipset Model: Apple Paravirtualized Graphics Device
+VRAM (Total): 8 GB
+```
+
+**方法三：截取 guest 画面**
 
 ```powershell
 function Get-GuestScreen {
-    param([string]$OutPng = 'C:\macOS\tools\screen.png')
-    $ppm = $OutPng -replace '\.png$', '.ppm'
+    param([string]$Output = "$env:TEMP\guest-screen.png")
+
+    $ppm = $Output -replace '\.png$', '.ppm'
     Remove-Item $ppm -Force -ErrorAction SilentlyContinue
 
-    $c = New-Object System.Net.Sockets.TcpClient
-    $c.Connect('127.0.0.1', 4444)
-    $s = $c.GetStream()
-    $r = New-Object System.IO.StreamReader($s)
-    $w = New-Object System.IO.StreamWriter($s)
-    $w.AutoFlush = $true
+    $client = New-Object System.Net.Sockets.TcpClient
+    $client.Connect('127.0.0.1', 4444)
+    $stream = $client.GetStream()
+    $reader = New-Object System.IO.StreamReader($stream)
+    $writer = New-Object System.IO.StreamWriter($stream)
+    $writer.AutoFlush = $true
+
     Start-Sleep -Milliseconds 300
-    $r.ReadLine() | Out-Null
-    $w.WriteLine('{"execute":"qmp_capabilities"}')
+    $reader.ReadLine() | Out-Null
+    $writer.WriteLine('{"execute":"qmp_capabilities"}')
     Start-Sleep -Milliseconds 150
-    $r.ReadLine() | Out-Null
-    $w.WriteLine('{"execute":"screendump","arguments":{"filename":"' + ($ppm -replace '\\','/') + '"}}')
+    $reader.ReadLine() | Out-Null
+    $writer.WriteLine('{"execute":"screendump","arguments":{"filename":"' + ($ppm -replace '\\','/') + '"}}')
     Start-Sleep -Milliseconds 1500
-    $r.ReadLine() | Out-Null
-    $c.Close()
+    $reader.ReadLine() | Out-Null
+    $client.Close()
 
-    python -c "from PIL import Image; Image.open(r'$ppm').save(r'$OutPng')"
-    Write-Output $OutPng
+    python -c "from PIL import Image; Image.open(r'$ppm').save(r'$Output')"
+    Write-Output $Output
 }
+
+Get-GuestScreen
 ```
 
-### 7.4 打快照
+---
+
+# 七、日常操作
+
+## 7.1 启动
 
 ```powershell
-& $pwsh7 -NoProfile -ExecutionPolicy Bypass -File "$repo\scripts\windows\snapshot.ps1"
+$REPO  = 'D:\reims\reims-vgpu-windows-native-tahoe'
+$pwsh7 = 'C:\Program Files\PowerShell\7\pwsh.exe'
+Set-Location $REPO
+$env:REIMS_MSYS2_ROOT = 'C:\msys64'
+$env:PATH = "C:\msys64\ucrt64\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
+& $pwsh7 -NoProfile -ExecutionPolicy Bypass -File "$REPO\scripts\windows\start.ps1"
 ```
 
-### 7.5 看 GPU 实时统计
+## 7.2 停止
 
 ```powershell
-$latest = Get-ChildItem "$repo\vm\logs" -Directory | Sort-Object Name -Descending | Select-Object -First 1
-Get-Content "$latest\stderr.log" -Tail 5 -Wait
+# 正常停止（请求 guest 关机，等待超时）
+& $pwsh7 -NoProfile -ExecutionPolicy Bypass -File "$REPO\scripts\windows\stop.ps1"
+
+# 强制停止（丢弃未保存数据）
+& $pwsh7 -NoProfile -ExecutionPolicy Bypass -File "$REPO\scripts\windows\stop.ps1" -Force
 ```
 
-输出示例：
-```
-reims-vgpu stats: port 0: guest 10.0/s, max gap 101.0 ms;
-                  window 10.0/s, max gap 100.9 ms;
-                  window GPU 2.09 ms avg, 2.67 ms max
-```
-
-`window GPU X ms avg` = 每帧 GPU 耗时。**这就是 RTX 3060 在实际渲染的证据**。
-
-### 7.6 恢复 VMware（关掉 Hyper-V）
+## 7.3 快照
 
 ```powershell
-# 管理员 PowerShell
+& $pwsh7 -NoProfile -ExecutionPolicy Bypass -File "$REPO\scripts\windows\snapshot.ps1"
+```
+
+## 7.4 环境自检
+
+```powershell
+& $pwsh7 -NoProfile -ExecutionPolicy Bypass -File "$REPO\scripts\windows\doctor.ps1" -RequireWhpx
+```
+
+输出 JSON 中检查以下字段：
+
+| 字段 | 期望值 |
+|---|---|
+| `WhpxFeatureEnabled` | `true` |
+| `WhpxHypervisorPresent` | `true` |
+| `WhpxCapabilityResult` | `0` |
+| `HypervisorPresent` | `true` |
+| `GPU` | 包含实际显卡型号 |
+| `Tools` | 全部路径非空 |
+
+## 7.5 SSH 连接 guest
+
+guest 需先安装 `REIMSTOOLS`（见 6.6）。安装后：
+
+```bash
+ssh -p 2222 <用户名>@127.0.0.1
+```
+
+端口映射来源：QEMU 参数 `hostfwd=tcp:127.0.0.1:2222-:22`。
+
+## 7.6 安装 REIMSTOOLS
+
+macOS 桌面上有名为 `REIMSTOOLS` 的磁盘。打开后运行 `setup.command`。
+
+功能：
+- 安装宿主机 SSH 公钥
+- 启用 SSH 服务
+- 设置日语键盘与时区偏好
+- 设置 Metal 错误模式
+- 配置免密 sudo（仅限 shutdown / restart 命令）
+
+## 7.7 恢复 VMware Workstation
+
+管理员 PowerShell：
+
+```powershell
 Disable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -NoRestart
 Disable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -NoRestart
 Disable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -NoRestart
@@ -1265,177 +1484,305 @@ bcdedit /set hypervisorlaunchtype off
 Restart-Computer
 ```
 
-重启后 VMware 恢复正常，vmdk 文件不受影响。
+vmdk 文件不受影响。
 
 ---
 
-## 8. 性能实测数据
+# 八、故障对照表
 
-### 8.1 本次实测（i7-12700KF + RTX 3060 + 8 vCPU / 8 GB）
+## 8.1 编译阶段
 
-| 指标 | 数值 | 说明 |
+| 错误信息 | 原因 | 解决 |
 |---|---|---|
-| **GPU 每帧耗时** | **2.0–2.4 ms avg, 2.5–3.0 ms max** | 从 `stderr.log` 统计 |
-| 静态界面刷新 | 10.0 /s | OpenCore 菜单 |
-| 图形界面 | 正常 | Recovery、设置向导、桌面全渲染 |
-| **实时高斯模糊** | ✅ 正常 | GPU 渲染（VMware 做不到） |
-| 内存占用 | 8.15–8.97 GB | guest 用满配置 |
-| 内核启动时间 | ~60 秒 | 从 OpenCore 选单到 Recovery |
-| 系统安装时间 | ~35 分钟 | 16:26 → 17:01 |
-| 磁盘写入 | 32.5 GB | Sequoia 15.3 完整安装 |
+| `error: linker 'link.exe' not found` | Rust 使用 MSVC 工具链 | `rustup default 1.98.1-x86_64-pc-windows-gnu`，并设 `CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER` |
+| `make: clang: No such file or directory` | PATH 使用 Windows 格式，MSYS2 bash 不识别 | bash 内 PATH 用 `/c/msys64/ucrt64/bin` 格式 |
+| `lld-link: error: could not open 'C:/msys64/nologo'` | MSYS2 将 `/nologo` 转为路径 | 设 `MSYS2_ARG_CONV_EXCL=*` |
+| `lld-link: error: could not open '/d/reims/.../ReimsVgpu.obj'` | `ARG_CONV_EXCL=*` 同时禁用路径转换 | BUILD 参数改为 `D:/reims/...` |
+| `can't open file 'D:/d/reims/.../mkvenv.py'` | configure 阶段设置了 `ARG_CONV_EXCL` | configure 不设该变量 |
+| `Dependency "reims-vgpu" not found` | PKG_CONFIG_PATH 格式错误，或 pc 文件 `-lxxx.dll` | 路径用 `/d/...`，pc 文件改 `-lxxx` |
+| `qemu-system-x86_64.exe` 退出码 `-1073741515` | 缺 `reims_vgpu_c.dll` | 复制 dll 与 rom 到 `build\qemu\` |
+| `Unable to find type [System.Runtime.Intrinsics.X86.X86Base]` | 使用 PowerShell 5.1 | 使用 `C:\Program Files\PowerShell\7\pwsh.exe` |
+| `ParserError` 出现在 prepare-opencore.ps1 | 写回时使用了带 BOM 的 UTF8 | 使用 `UTF8Encoding($false)` |
 
-### 8.2 作者公布的数据（RTX 5080）
+## 8.2 引导阶段
 
-| 指标 | 数值 |
-|---|---|
-| Chrome TestUFO | 约 38 FPS |
-| Safari WebGL 测试 | 全 22 项通过（含 180 帧、资源生命周期、丢失恢复） |
-| 4K 分辨率 | ⚠️ 宽度 > 2048 有已知 tile-texture 失败 |
-| 长时间运行 | ⚠️ device loss 未完全验证 |
-
-### 8.3 与 VMware 方案对比
-
-| 指标 | VMware + Sonoma | reims-vgpu + Sequoia |
+| 现象 | 原因 | 解决 |
 |---|---|---|
-| 图形渲染 | 软件（SVGA） | **硬件（RTX 3060）** |
-| 模糊效果 | 做不到 | ✅ |
-| 帧耗时 | 不适用 | **2.2 ms** |
-| 显存 | 128 MB | **8 GB** |
+| `OCB: System has no boot entries` + `OC: Failed to show boot menu!` | `ScanPolicy=0x301` 缺 SATA 位（bit 16） | 改为 `ScanPolicy=0` |
+| 同上，修改脚本后仍出现 | `config.plist` 已存在，脚本跳过生成 | 删除 `config.plist` 后执行 `-Rebuild` |
+| 同上，删除 config 后仍出现 | 脚本内硬编码的默认值未改 | 修改 `prepare-opencore.ps1` 第 60、64 行 |
+| `cannot open device 'disk0': Operation not permitted` | macOS 内在线修改 GPT 分区表 | 不可在线操作，需进入 Recovery |
+| 菜单一闪而过 | `Timeout=0` | 改为 `Timeout=20` |
+| 方向键无响应 | QMP `send-key` 发到 PS/2 | 改用 HMP `sendkey` |
+| QEMU 崩溃 `qemu-fixed-text-console.device not found` | 使用 QMP `input-send-event` | 改用 HMP `sendkey` |
+| `Property 'qemu-fixed-text-console.device' not found` | 同上 | 同上 |
+
+## 8.3 安装阶段
+
+| 现象 | 原因 | 解决 |
+|---|---|---|
+| 安装到一半重启回到菜单 | 正常行为，macOS 安装多次重启 | 菜单中选 `Macintosh HD` |
+| `所选宗卷的可用空间不足` | 磁盘容量小于系统需求 | 增大 `-DiskGiB` |
+| 图形界面花屏 | 分辨率超过 2048 宽 | 改为 `1920x1080` |
+
+## 8.4 运行阶段
+
+| 现象 | 原因 | 解决 |
+|---|---|---|
+| `window GPU -` | 画面无更新（静态） | 正常，操作界面后会显示数值 |
+| SSH 连接被拒绝 | guest 未安装 REIMSTOOLS | 运行 `setup.command` |
+| VMware 无法启动 | Hyper-V 占用 VT-x | 见 6.7 |
 
 ---
 
-## 9. 故障排查
+# 九、关键配置速查
 
-### 9.1 `doctor.ps1` 报 `Unable to find type [System.Runtime.Intrinsics.X86.X86Base]`
+## 9.1 OpenCore config.plist
 
-**原因**：用 Windows PowerShell 5.1 跑，脚本要求 PowerShell 7+。
+| 路径 | 值 | 作用 |
+|---|---|---|
+| `Misc/Boot/Timeout` | `20` | 菜单等待秒数 |
+| `Misc/Boot/ShowPicker` | `True` | 显示启动菜单 |
+| `Misc/Boot/HideAuxiliary` | `False` | 显示 Recovery 等辅助项 |
+| `Misc/Security/ScanPolicy` | `0` | 不限制扫描范围 |
+| `Misc/Security/SecureBootModel` | `x86legacy` | 兼容 x86 平台 |
+| `Misc/Security/HaltLevel` | `0x80000000` | 错误即 halt |
+| `Misc/Security/Vault` | `Optional` | 不校验 EFI 签名 |
+| `Misc/Security/DmgLoading` | `Signed` | 允许加载签名 DMG |
+| `Booter/Quirks/SetupVirtualMap` | `True` | 建立虚拟内存映射 |
+| `Booter/Quirks/RebuildAppleMemoryMap` | `True` | 重建内存映射 |
+| `Booter/Quirks/SyncRuntimePermissions` | `True` | 同步运行时权限 |
+| `Booter/Quirks/EnableWriteUnprotector` | `False` | 不禁用写保护 |
+| `Kernel/Emulate/DummyPowerManagement` | `True` | 替代 XCPM |
+| `Kernel/Add` | 空数组 | 不加载任何 kext |
+| `ACPI/Add` | 空数组 | 不加载任何 ACPI 表 |
+| `NVRAM boot-args` | `-v keepsyms=1 serial=3 debug=0x108` | 详细日志 |
+| `UEFI/Drivers` | OpenRuntime / OpenPartitionDxe / OpenHfsPlus | 运行时、分区解析、HFS+ 读取 |
+| `UEFI/Input/KeySupport` | `True` | 键盘支持 |
+| `UEFI/Input/KeyForgetThreshold` | `5` | 按键去抖阈值 |
+| `UEFI/Output/Resolution` | `1920x1080` | 输出分辨率 |
 
-**解决**：用 `C:\Program Files\PowerShell\7\pwsh.exe` 跑。
+## 9.2 QEMU 命令行
 
-### 9.2 Startup 报 `Property 'qemu-fixed-text-console.device' not found`
+完整参数见 `vm\logs\<时间戳>\command.json`。关键段落：
 
-**原因**：用了 QMP `input-send-event`，在 `-display none` 模式下崩溃。
+```
+-accel whpx,hyperv=off
+-cpu Haswell-noTSX,stepping=3,vendor=GenuineIntel,+ssse3,+sse4.2,+popcnt,+avx,+avx2,+aes,+xsave,+xsaveopt,-arat,enforce
+-smp 8,sockets=1,cores=8,threads=1
+-m 8192M
 
-**解决**：改用 HMP `sendkey`（见 7.2）。
+-device isa-applesmc,osk=ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc
 
-### 9.3 IP 地址 / 网络不通
+-drive if=pflash,format=raw,readonly=on,file=<OVMF_CODE.fd>
+-drive if=pflash,format=raw,file=<OVMF_VARS.fd>
 
-**QEMU 的网络**：`-netdev user`（slirp NAT）+ `hostfwd=tcp:127.0.0.1:2222-:22`
+-device ich9-ahci,id=sata,addr=0x2
+-drive  id=opencore,if=none,format=raw,snapshot=on,file=<OpenCore.img>
+-device ide-hd,bus=sata.2,drive=opencore,bootindex=1
+-drive  id=disk,if=none,format=qcow2,file=<current.qcow2>
+-device ide-hd,bus=sata.3,drive=disk,rotation_rate=1
+-drive  id=installer,if=none,format=raw,snapshot=on,file=<ISO>
+-device ide-hd,bus=sata.4,drive=installer
 
-- guest 内 IP 通常是 `10.0.2.15`
-- 宿主机通过 `127.0.0.1:2222` SSH 到 guest
-- guest 访问外网正常（NAT）
+-vga none
+-device {"driver":"apple-gfx-pci","id":"gfx","bus":"pcie.0","addr":"0x4",
+         "displays":1,"resolution":"1920x1080",
+         "romfile":"<ReimsVgpu.rom>",
+         "display-modes":["1920x1080@60","1280x720@60","2560x1440@60","3840x2160@60"]}
 
-**如果 SSH 连不上**：需要先在 guest 里装 `REIMSTOOLS`（Finder 里的那个磁盘 → `setup.command`）。
+-device qemu-xhci,id=xhci,addr=0x5,p2=8,p3=6,conditional-intr-mapping=on
+-device usb-kbd,id=kbd,bus=xhci.0
+-device usb-tablet,id=tablet,bus=xhci.0
 
-### 9.4 想改分辨率
+-netdev user,id=net0,ipv6=off,hostfwd=tcp:127.0.0.1:2222-:22
+-device virtio-net-pci,netdev=net0,id=net0,mac=<MAC>,addr=0x3
 
-编辑 `vm\state\config.json` 的 `resolution`，或者启动时用 `start.ps1` 的参数。然后 `stop` + `start`。
+-display none
+-qmp tcp:127.0.0.1:4444,server=on,wait=off
+-serial file:<serial.log>
+-no-shutdown
+```
 
-**已知限制**：> 2048 宽度有 tile-texture 失败风险。
+## 9.3 虚拟机配置 vm\state\config.json
 
-### 9.5 想改 CPU / 内存
-
-编辑 `vm\state\config.json`：
 ```json
 {
-  "cpus": 8,          → 改成 12（但不要超过物理核心数）
-  "memory_mib": 8192  → 改成 16384
+  "schema": 1,
+  "cpus": 8,
+  "memory_mib": 8192,
+  "resolution": "1920x1080",
+  "disk_gib": 128,
+  "cpu": "Haswell-noTSX,stepping=3,vendor=GenuineIntel,+ssse3,+sse4.2,+popcnt,+avx,+avx2,+aes,+xsave,+xsaveopt,-arat,enforce",
+  "mac": "52:54:00:xx:xx:xx",
+  "qmp_port": 4444,
+  "ssh_port": 2222,
+  "iso": "<ISO 路径>",
+  "media_kind": "disk",
+  "base_disk": "<base.qcow2>",
+  "active_disk": "<current.qcow2>",
+  "opencore": "<OpenCore.img>",
+  "firmware_code": "<OVMF_CODE.fd>",
+  "firmware_vars": "<OVMF_VARS.fd>",
+  "rom": "<ReimsVgpu.rom>"
 }
 ```
-然后 `stop` + `start`。
 
-### 9.6 磁盘空间不够
-
-`base.qcow2` 是 128 GB 稀疏盘。要扩容：
-
-```powershell
-& "$repo\build\qemu\qemu-img.exe" resize "$repo\vm\disks\base.qcow2" 256G
-# 然后在 macOS 里用磁盘工具扩 APFS 容器
-```
-
-**注意**：`current.qcow2` 是 overlay，扩容前要先合并或重建。
+修改 `cpus` / `memory_mib` / `resolution` 后需 `stop` + `start` 生效。
 
 ---
 
-## 附录 A：一条命令看完整个流程
+# 十、文件清单
 
-```powershell
-# 只在环境已准备好时用（工具链、Rust、源码都就位）
-$repo  = 'D:\reims\reims-vgpu-windows-native-tahoe'
-$pwsh7 = 'C:\Program Files\PowerShell\7\pwsh.exe'
+## 10.1 编译产物
 
-# 1. 编固件
-& 'C:\msys64\usr\bin\bash.exe' -lc @'
-export PATH=/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH
-export MSYSTEM=UCRT64
-export MSYS2_ARG_CONV_EXCL=*
-cd /d/reims/reims-vgpu-windows-native-tahoe
-make -C firmware OS=Windows_NT BUILD=D:/reims/reims-vgpu-windows-native-tahoe/.work/target/firmware rom
-'@
+| 路径 | 大小 | 作用 |
+|---|---|---|
+| `build\qemu\qemu-system-x86_64.exe` | 71 MB | QEMU 主程序（含 apple-gfx-pci） |
+| `build\qemu\qemu-img.exe` | 11 MB | 磁盘镜像工具 |
+| `build\qemu\qemu-io.exe` | 11 MB | 磁盘 IO 工具 |
+| `build\qemu\reims_vgpu_c.dll` | 191 MB | Vulkan→Metal 翻译层 |
+| `build\qemu\ReimsVgpu.rom` | 5.5 KB | GPU option ROM |
+| `.work\target\dist-vulkan\lib\libreims_vgpu.a` | 606 MB | 静态库 |
+| `.work\target\firmware\ReimsVgpu.efi` | 5.3 KB | UEFI 驱动 |
+| `.work\target\firmware\ReimsVgpu.rom` | 5.5 KB | 同上 rom |
 
-# 2. 编 Rust
-$env:RUSTUP_TOOLCHAIN = '1.98.1-x86_64-pc-windows-gnu'
-$env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = 'C:\msys64\ucrt64\bin\clang.exe'
-$env:CC = 'C:\msys64\ucrt64\bin\clang.exe'
-$env:CARGO_TARGET_DIR = "$repo\.work\target"
-Set-Location $repo
-& "$env:USERPROFILE\.cargo\bin\cargo.exe" xtask dist --platform vulkan --profile release
+## 10.2 虚拟机文件
 
-# 3. 复制 DLL 和 ROM
-$dist = "$repo\.work\target\dist-vulkan"
-Copy-Item "$dist\lib\reims_vgpu_c.dll" "$repo\build\qemu\" -Force
-Copy-Item "$dist\share\reims-vgpu\ReimsVgpu.rom" "$repo\build\qemu\" -Force
+| 路径 | 大小 | 作用 |
+|---|---|---|
+| `vm\firmware\OVMF_CODE.fd` | 3.48 MB | UEFI 固件 |
+| `vm\firmware\OVMF_VARS.fd` | 0.52 MB | NVRAM 存储 |
+| `vm\firmware\opencore-1.0.8\OpenCore.img` | 504 MB | 引导盘 |
+| `vm\disks\base.qcow2` | 128 GB（稀疏） | 系统盘基础 |
+| `vm\disks\current.qcow2` | 实际写入量 | 系统盘 overlay |
 
-# 4. 启动
-$env:REIMS_MSYS2_ROOT = 'C:\msys64'
-& $pwsh7 -NoProfile -ExecutionPolicy Bypass -File "$repo\scripts\windows\start.ps1"
-```
+## 10.3 外部依赖
 
----
+| 路径 | 用途 |
+|---|---|
+| `C:\msys64\` | 编译环境 |
+| `C:\msys64\ucrt64\share\qemu\edk2-x86_64-code.fd` | OVMF code |
+| `C:\msys64\ucrt64\share\qemu\edk2-i386-vars.fd` | OVMF vars 模板 |
+| `C:\Users\<用户>\.cargo\` | Rust 工具链 |
+| `C:\Program Files\PowerShell\7\` | PowerShell 7 |
 
-## 附录 B：参考链接
+## 10.4 日志
 
-- **reims-vgpu 主仓库**：https://github.com/steelbrain/reims-vgpu
-- **Windows 分支**：https://github.com/tqmane/reims-vgpu/tree/windows-native-tahoe
-- **QEMU 分支**：https://github.com/tqmane/qemu-reims-vgpu/tree/windows-native-tahoe
-- **metal2vulkan**：https://github.com/tqmane/metal2vulkan
-- **OpenCore**：https://github.com/acidanthera/OpenCorePkg
-- **reims 文档**：
-  - `docs/windows-vm.md` —— Windows VM 准备与管理
-  - `docs/IMPLEMENTATION_STATUS.md` —— 实现状态
-  - `docs/KNOWN_ISSUES.md` —— 已知问题
+| 路径 | 内容 |
+|---|---|
+| `vm\logs\<时间戳>\command.json` | 完整 QEMU 命令行 |
+| `vm\logs\<时间戳>\serial.log` | OpenCore 与内核串口输出 |
+| `vm\logs\<时间戳>\stderr.log` | GPU 统计（`window GPU X ms`） |
+| `vm\logs\<时间戳>\qmp-status.json` | QMP 状态 |
 
 ---
 
-## 附录 C：本次实测环境快照
+# 十一、实测数据
+
+## 11.1 测试环境
 
 ```
-CPU      : 12th Gen Intel Core i7-12700KF (12C/20T)
+CPU      : Intel Core i7-12700KF (12C/20T)
 主板     : ASUS PRIME B760M-K D4
 内存     : 64 GB DDR4-3200
 显卡     : NVIDIA GeForce RTX 3060 (驱动 32.0.16.1742)
-存储     : 致态 Ti600 1TB NVMe + 4TB SATA
-OS       : Windows 11
+存储     : 1 TB NVMe + 4 TB SATA
+系统     : Windows 11
 
-MSYS2    : 2024-01-13 base
+MSYS2    : 2024-01-13
 clang    : 23.1.5
 cmake    : 4.4.5
 ninja    : 1.13.2
 meson    : 1.12.1
 Rust     : 1.98.1-x86_64-pc-windows-gnu
 PowerShell: 7.4.6
-QEMU     : 11.1.50 (自编译，--enable-pvg --enable-whpx)
+QEMU     : 11.1.50
 OpenCore : 1.0.8
 macOS    : Sequoia 15.3 (24D60)
 VM 配置  : 8 vCPU / 8 GB / 128 GB qcow2 / 1920x1080
-
-结果     : ✅ 安装成功，GPU 加速生效（2.2 ms/帧）
-测试日期 : 2026-11-10
 ```
+
+## 11.2 时间统计
+
+| 阶段 | 耗时 |
+|---|---|
+| MSYS2 安装 + 初始化 | 8 分钟 |
+| 工具链安装 | 12 分钟 |
+| 源码下载 | 2 分钟 |
+| GPU 固件编译 | 20 秒 |
+| Rust dist 编译 | 3 分 17 秒 |
+| QEMU configure | 40 秒 |
+| QEMU 编译 | 约 28 分钟 |
+| OpenCore 生成 | 15 秒 |
+| 虚拟机磁盘准备 | 20 秒 |
+| macOS 安装 | 35 分钟 |
+| **合计** | **约 80 分钟** |
+
+## 11.3 GPU 性能
+
+从 `stderr.log` 提取，共 4797 条有效样本：
+
+```
+window GPU 1.80 ms avg, 2.57 ms max
+window GPU 2.09 ms avg, 3.03 ms max
+window GPU 2.26 ms avg, 3.29 ms max
+window GPU 2.96 ms avg, 2.96 ms max
+window GPU 3.24 ms avg, 5.56 ms max
+window GPU 3.30 ms avg, 5.38 ms max
+```
+
+| 指标 | 数值 |
+|---|---|
+| 单帧 GPU 耗时 | 1.8–3.3 ms（平均） |
+| 单帧 GPU 耗时峰值 | 2.6–5.6 ms |
+| 静态界面刷新率 | 10 帧/秒 |
+| 活跃界面刷新率 | 18–26 帧/秒 |
+| 实时高斯模糊 | 正常 |
+| 内存占用 | 8.15–8.97 GB |
+
+## 11.4 上游公布数据
+
+来源：`docs/KNOWN_ISSUES.md`（2026-10-18 更新）
+
+| 项目 | 数据 |
+|---|---|
+| 测试硬件 | M3 Max（arm64）、RTX 5080 laptop（x86-64 Linux） |
+| Safari WebGL 测试 | 22 项全通过（含 180 帧、资源生命周期、丢失恢复） |
+| Chrome TestUFO | 约 38 帧/秒，存在长帧间隔 |
+| 4K 分辨率 | 宽度 > 2048 存在 tile-texture 失败 |
+| 长时间运行 | device loss 未完成验证 |
+| 稳定 60 帧 | 未复现 |
 
 ---
 
-**文档版本**：1.0
-**编写时间**：2026-11-10
-**验证状态**：全部步骤均实际执行并通过
+# 十二、参考
+
+| 资源 | 地址 |
+|---|---|
+| reims-vgpu 主仓库 | `https://github.com/steelbrain/reims-vgpu` |
+| Windows 分支 | `https://github.com/tqmane/reims-vgpu/tree/windows-native-tahoe` |
+| QEMU 分支 | `https://github.com/tqmane/qemu-reims-vgpu/tree/windows-native-tahoe` |
+| metal2vulkan | `https://github.com/tqmane/metal2vulkan` |
+| OpenCore | `https://github.com/acidanthera/OpenCorePkg` |
+| Windows VM 文档 | 仓库内 `docs/windows-vm.md` |
+| 实现状态 | 仓库内 `docs/IMPLEMENTATION_STATUS.md` |
+| 已知问题 | 仓库内 `docs/KNOWN_ISSUES.md` |
+
+关键源码文件：
+
+| 文件 | 作用 |
+|---|---|
+| `vendor/qemu/hw/display/apple-gfx.c` | 虚拟 GPU 主体 |
+| `vendor/qemu/hw/display/apple-gfx-pci.c` | PCI 设备注册 |
+| `vendor/qemu/hw/display/apple-gfx-mmio.c` | MMIO 寄存器实现 |
+| `vendor/qemu/hw/display/apple-gfx-activity.m` | Metal 活动状态桥接 |
+| `crates/reims-vgpu-vulkan/` | Vulkan 后端 |
+| `crates/reims-vgpu-metal/` | Metal 接口定义 |
+| `crates/reims-vgpu-c/` | C ABI 导出 |
+
+---
+
+文档版本：2.0
+编写日期：2026-11-10
+验证状态：全部步骤经实际执行验证
